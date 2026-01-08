@@ -54,6 +54,17 @@ release: undawn_reroll
 	cp /mingw64/bin/libjpeg-8.dll Release/UndawnReroll/
 	cp /mingw64/bin/libgcc_s_seh-1.dll Release/UndawnReroll/
 	cp /mingw64/bin/libwinpthread-1.dll Release/UndawnReroll/
+	cp /mingw64/bin/libtiff-6.dll Release/UndawnReroll/
+	cp /mingw64/bin/libjbig-0.dll Release/UndawnReroll/
+	cp /mingw64/bin/libwebp-7.dll Release/UndawnReroll/
+	cp /mingw64/bin/libwebpdecoder-3.dll Release/UndawnReroll/
+	cp /mingw64/bin/libwebpdemux-2.dll Release/UndawnReroll/
+	cp /mingw64/bin/libwebpmux-3.dll Release/UndawnReroll/
+	cp /mingw64/bin/libsharpyuv-0.dll Release/UndawnReroll/
+	cp /mingw64/bin/libzstd.dll Release/UndawnReroll/
+	cp /mingw64/bin/liblzma-5.dll Release/UndawnReroll/
+	cp /mingw64/bin/libLerc.dll Release/UndawnReroll/
+	cp /mingw64/bin/libdeflate.dll Release/UndawnReroll/
 	/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -Command "Compress-Archive -Path 'Release\\UndawnReroll\\*' -DestinationPath 'UndawnReroll_Portable.zip' -Force"
 
 onefile: release launcher.res

@@ -1,0 +1,16 @@
+#include <windows.h>
+
+// Définition des identifiants
+#define IDM_ABOUT 101
+
+// Définition de l'icône du programme
+1 ICON "unnamed.ico"
+
+// Définition du menu
+IDM_MENU MENU
+BEGIN
+    POPUP "&À propos"
+    BEGIN
+        MENUITEM "Made by Th0r", IDM_ABOUT
+    END
+END

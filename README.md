@@ -49,7 +49,14 @@ Ce projet est écrit en C et utilise la bibliothèque GTK+ 3.
 
 ### Prérequis
 *   MSYS2 (avec MinGW 64-bit)
-*   Paquets : `mingw-w64-x86_64-gtk3`, `mingw-w64-x86_64-toolchain`
+*   Paquets : `mingw-w64-x86_64-gtk3`, `mingw-w64-x86_64-toolchain`, `make`
+
+Dans un terminal MSYS2 (MINGW64), installez/mettez à jour:
+
+```
+pacman -Syu --noconfirm
+pacman -S --needed --noconfirm mingw-w64-x86_64-toolchain mingw-w64-x86_64-gtk3 make
+```
 
 ### Build
 Pour générer l'exécutable unique avec MSYS2 :

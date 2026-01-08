@@ -54,7 +54,7 @@ release: undawn_reroll
 	cp /mingw64/bin/libjpeg-8.dll Release/UndawnReroll/
 	cp /mingw64/bin/libgcc_s_seh-1.dll Release/UndawnReroll/
 	cp /mingw64/bin/libwinpthread-1.dll Release/UndawnReroll/
-	powershell.exe -NoProfile -Command "Compress-Archive -Path 'Release\\UndawnReroll\\*' -DestinationPath 'UndawnReroll_Portable.zip' -Force"
+	/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -Command "Compress-Archive -Path 'Release\\UndawnReroll\\*' -DestinationPath 'UndawnReroll_Portable.zip' -Force"
 
 onefile: release launcher.res
 	windres launcher.rc -O coff -o launcher.res

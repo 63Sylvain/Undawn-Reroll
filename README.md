@@ -52,10 +52,15 @@ Ce projet est écrit en C et utilise la bibliothèque GTK+ 3.
 *   Paquets : `mingw-w64-x86_64-gtk3`, `mingw-w64-x86_64-toolchain`
 
 ### Build
-Pour générer l'exécutable unique :
-1.  Ouvrez le dossier du projet.
-2.  Lancez le script `create_onefile.bat`.
-    *   Cela va compiler le code, copier les DLLs, créer une archive, et compiler le lanceur autonome.
+Pour générer l'exécutable unique avec MSYS2 :
+1. Ouvrez un terminal MSYS2 (MINGW64).
+2. Exécutez :
+
+```
+make onefile
+```
+
+Cela compile le binaire, copie les DLLs, crée l'archive ZIP et construit l'exécutable autonome.
 
 ---
 **Note** : Ce logiciel n'est pas affilié à Level Infinite ou LightSpeed Studios. Utilisez-le à vos propres risques.

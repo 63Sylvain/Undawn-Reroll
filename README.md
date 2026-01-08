@@ -10,7 +10,7 @@ Cet outil permet de gérer facilement plusieurs comptes pour le jeu **Undawn** (
 
 ## 📥 Installation
 
-Téléchargez simplement la dernière version (`UndawnReroll_OneFile.exe`) depuis l'onglet [Releases](https://github.com/votre-pseudo/Undawn-Reroll/releases) (à adapter une fois sur GitHub).
+Téléchargez simplement la dernière version (`UndawnReroll_OneFile.exe`) depuis l'onglet [Releases](https://github.com/63Sylvain/Undawn-Reroll/releases).
 
 ## 📖 Utilisation
 

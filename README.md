@@ -61,13 +61,17 @@ pacman -S --needed --noconfirm mingw-w64-x86_64-toolchain mingw-w64-x86_64-gtk3 
 ### Build
 Pour générer l'exécutable unique avec MSYS2 :
 1. Ouvrez un terminal MSYS2 (MINGW64).
-2. Exécutez :
+2. Exécutez la cible Make `onefile` :
 
 ```
 make onefile
 ```
 
-Cela compile le binaire, copie les DLLs, crée l'archive ZIP et construit l'exécutable autonome.
+Cette commande :
+- compile l'application,
+- copie les DLL nécessaires,
+- crée l'archive `UndawnReroll_Portable.zip`,
+- génère l'exécutable autonome `UndawnReroll_OneFile.exe` à la racine du projet.
 
 ---
 **Note** : Ce logiciel n'est pas affilié à Level Infinite ou LightSpeed Studios. Utilisez-le à vos propres risques.

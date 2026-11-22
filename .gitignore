@@ -27,9 +27,4 @@ build/
 
 # Temporary files
 UndawnReroll_Portable.zip
-UndawnReroll_OneFile.exe
-launcher.res
 undawn_reroll.res
-
-# Keep specific DLLs if they are part of the source repo (usually bad practice, but sometimes needed if not building from scratch)
-# For now, we ignore all DLLs as they are copied from MSYS2 during build.

@@ -5,73 +5,62 @@ Cet outil permet de gérer facilement plusieurs comptes pour le jeu **Undawn** (
 ## 🚀 Fonctionnalités
 
 *   **Multi-comptes** : Basculez entre vos comptes en un clic.
-*   **Lancement automatique** : Lance le jeu via Steam après le changement de compte.
-*   **Portable** : Fonctionne sans installation (version OneFile).
+*   **100 % Autonome (Win32 natif)** : Un seul exécutable `undawn_reroll.exe` sans aucune DLL externe requise (plus besoin de GTK3).
+*   **Détection en direct** : Affiche le profil actuellement actif (`intl_auth.txt`) et avertit si le jeu (`Toaa-Win64-Shipping.exe`) est en cours d'exécution.
+*   **Gestion complète** : Créer, mettre à jour (copie atomique sécurisée), renommer, supprimer et rafraîchir la liste des profils.
+*   **Lancement Steam optionnel** : Case à cocher « Lancer le jeu via Steam » pour choisir de basculer avec ou sans démarrage immédiat du jeu.
+*   **Menu Outils** : Accès direct au dossier des profils dans l'Explorateur et sauvegarde complète (Backup horodaté) de tous vos comptes.
 
 ## 📥 Installation
 
-Téléchargez simplement la dernière version (`UndawnReroll_OneFile.exe`) depuis l'onglet [Releases](https://github.com/63Sylvain/Undawn-Reroll/releases).
+Téléchargez simplement `undawn_reroll.exe` (ou `UndawnReroll_OneFile.exe`) depuis l'onglet [Releases](https://github.com/63Sylvain/Undawn-Reroll/releases). Aucune installation ni bibliothèque externe n'est nécessaire.
 
 ## 📖 Utilisation
 
 ### 1. Lancement
-Double-cliquez sur `UndawnReroll_OneFile.exe`.
+Double-cliquez sur `undawn_reroll.exe`.
 
 ### 2. Détection
-Au lancement, le programme analyse le dossier d'authentification du jeu (généralement `C:\Users\[User]\AppData\Local\Toaa\INTL\28014\Toaa-Win64-Shipping`).
-Vos comptes sauvegardés apparaîtront dans le menu déroulant.
+Au lancement, le programme analyse le dossier d'authentification du jeu (`%LOCALAPPDATA%\Toaa\INTL\28014\Toaa-Win64-Shipping`).
+Vos comptes sauvegardés (`intl_auth.txt.*`) apparaissent triés dans le menu déroulant, et l'état du compte actif ainsi que du jeu s'affichent automatiquement.
 
 ### 3. Gestion des comptes
 
-#### ➤ Lancer un compte
-1.  Sélectionnez un compte dans la liste.
-2.  Cliquez sur **Lancer**.
-    *   *L'outil remplace le fichier d'auth actuel et lance le jeu via Steam (AppID 1881700).*
-
-#### ➤ Créer un nouveau profil
-1.  Connectez-vous à un nouveau compte dans le jeu, puis fermez le jeu.
-2.  Dans l'outil, cliquez sur **Créer**.
-3.  Donnez un nom (ex: "MonSmurf", "ComptePrincipal").
-    *   *L'outil sauvegarde le fichier d'auth actuel sous ce nom.*
-
-#### ➤ Mettre à jour un profil
-Si vous avez joué sur un compte et que vous voulez mettre à jour ses données sauvegardées :
-1.  Sélectionnez le nom du compte dans la liste.
-2.  Cliquez sur **Mettre à jour**.
-    *   *L'outil écrase la sauvegarde de ce profil avec les données actuelles du jeu.*
-
-#### ➤ Supprimer
-Sélectionnez un compte et cliquez sur **Supprimer** pour l'effacer de la liste.
+*   **Lancer** : Copie le profil sélectionné vers `intl_auth.txt` et lance le jeu via Steam (AppID 1881700) si la case « Lancer le jeu via Steam » est cochée.
+*   **Créer** : Sauvegarde le fichier `intl_auth.txt` actuel sous un nouveau nom de profil.
+*   **Mettre à jour** : Met à jour le profil sélectionné à partir du fichier `intl_auth.txt` actuel (de façon atomique pour ne jamais perdre l'ancienne sauvegarde en cas d'erreur).
+*   **Renommer / Supprimer / Rafraîchir** : Renomme un profil existant, le supprime après confirmation, ou actualise la liste.
+*   **Menu Outils** : Permet d'ouvrir directement le dossier des profils ou d'exporter une sauvegarde complète de tous les profils dans un dossier choisi.
 
 ## 🛠️ Compilation (Pour les développeurs)
 
-Ce projet est écrit en C et utilise la bibliothèque GTK+ 3.
+Ce projet est écrit en C99 et utilise uniquement l'API Win32 standard.
 
 ### Prérequis
 *   MSYS2 (avec MinGW 64-bit)
-*   Paquets : `mingw-w64-x86_64-gtk3`, `mingw-w64-x86_64-toolchain`, `make`
+*   Paquets : `mingw-w64-x86_64-toolchain`, `make`
 
-Dans un terminal MSYS2 (MINGW64), installez/mettez à jour:
+Dans un terminal MSYS2 (MINGW64) :
 
 ```
-pacman -Syu --noconfirm
-pacman -S --needed --noconfirm mingw-w64-x86_64-toolchain mingw-w64-x86_64-gtk3 make
+pacman -S --needed --noconfirm mingw-w64-x86_64-toolchain make
 ```
 
 ### Build
-Pour générer l'exécutable unique avec MSYS2 :
-1. Ouvrez un terminal MSYS2 (MINGW64).
-2. Exécutez la cible Make `onefile` :
+Pour compiler l'exécutable autonome :
+
+```
+make all
+```
+
+Pour générer également l'archive portable et `UndawnReroll_OneFile.exe` :
 
 ```
 make onefile
 ```
 
-Cette commande :
-- compile l'application,
-- copie les DLL nécessaires,
-- crée l'archive `UndawnReroll_Portable.zip`,
-- génère l'exécutable autonome `UndawnReroll_OneFile.exe` à la racine du projet.
+### Script utilitaire GTK3 (héritage / développement)
+Si vous travaillez aussi avec d'anciens binaires GTK3 compilés sous MSYS2, le script `Verifier_Env_GTK.bat` (`Verifier_Env_GTK.ps1`) vérifie et configure automatiquement `C:\msys64\mingw64\bin` dans votre variable d'environnement `PATH`.
 
 ---
 **Note** : Ce logiciel n'est pas affilié à Level Infinite ou LightSpeed Studios. Utilisez-le à vos propres risques.

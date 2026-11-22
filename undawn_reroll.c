@@ -1,1141 +1,1370 @@
-#include <gtk/gtk.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include <windows.h>
+#include <commctrl.h>
 #include <shellapi.h>
-#include <io.h>
-#include <direct.h>
-#include <winreg.h>
 #include <shlobj.h>
+#include <tlhelp32.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <wchar.h>
+#include <wctype.h>
 
-// Définition des identifiants de menu
-#define IDM_ABOUT 101
+#define APP_TITLE           L"Undawn Reroll"
+#define GAME_PROCESS_NAME   L"Toaa-Win64-Shipping.exe"
+#define STEAM_RUN_URL       L"steam://rungameid/1881700"
+#define AUTH_PREFIX         L"intl_auth.txt."
+#define AUTH_PREFIX_LEN     14
+#define MAX_ACCOUNT_NAME    100
 
-// Début du programme
+// Identifiants menu (synchronisés avec undawn_reroll.rc)
+#define IDM_MENU            100
+#define IDM_OPEN_FOLDER     101
+#define IDM_BACKUP_PROFILES 102
+#define IDM_EXIT            103
+#define IDM_ABOUT           104
 
-void create_auth_file(const wchar_t *account_name);
-void delete_auth_file(const wchar_t *account_name);
-void on_delete_account(GtkWidget *widget, gpointer data);
-void on_update_account(GtkWidget *widget, gpointer data);
-void on_create_account(GtkWidget *widget, gpointer data);
-void on_select_account(GtkWidget *widget, gpointer data);
+// Identifiants contrôles fenêtre principale
+#define IDC_LABEL_SELECT    200
+#define IDC_COMBO_ACCOUNTS  201
+#define IDC_BTN_REFRESH     202
+#define IDC_STATUS_ACTIVE   203
+#define IDC_STATUS_GAME     204
+#define IDC_CHK_STEAM       205
+#define IDC_BTN_LAUNCH      206
+#define IDC_BTN_CREATE      207
+#define IDC_BTN_UPDATE      208
+#define IDC_BTN_RENAME      209
+#define IDC_BTN_DELETE      210
 
-// Suppression des attributs unused pour éviter les warnings
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-function"
+// Identifiants dialogue de saisie
+#define IDC_PROMPT_LABEL    301
+#define IDC_PROMPT_EDIT     302
+
+#define MAIN_WND_CLASS      L"UndawnRerollMainWindowClass"
+#define PROMPT_WND_CLASS    L"UndawnRerollPromptDialogClass"
 
 typedef struct {
     wchar_t *name;
     wchar_t *auth_file;
 } Account;
 
-// Variables globales
-GList *accounts = NULL;
-GtkWidget *account_combo = NULL;
-wchar_t g_auth_dir[1024] = {0}; // Cache du chemin d'authentification
+typedef struct {
+    Account *items;
+    size_t count;
+    size_t capacity;
+} AccountList;
 
-// Initialise le chemin du dossier d'authentification s'il n'est pas déjà défini
-static void init_auth_dir(void) {
-    if (g_auth_dir[0] == 0) {
-        wchar_t *user_profile = _wgetenv(L"USERPROFILE");
-        if (user_profile) {
-            swprintf(g_auth_dir, sizeof(g_auth_dir)/sizeof(g_auth_dir[0]), 
-                    L"%ls\\AppData\\Local\\Toaa\\INTL\\28014\\Toaa-Win64-Shipping", user_profile);
-        }
-    }
+typedef struct {
+    const wchar_t *prompt_label;
+    wchar_t *buffer;
+    size_t buffer_cap;
+    BOOL accepted;
+    BOOL done;
+    HFONT font;
+    HWND edit_hwnd;
+} PromptState;
+
+static AccountList g_accounts = {0};
+static wchar_t g_auth_dir[1024] = {0};
+static HINSTANCE g_hInstance = NULL;
+static HFONT g_ui_font = NULL;
+static HWND g_main_hwnd = NULL;
+static BOOL g_game_is_running = FALSE;
+
+static int scale_dpi(int px, UINT dpi) {
+    return MulDiv(px, (int)dpi, 96);
 }
 
-void load_accounts(void) {
-    // Initialiser le chemin d'authentification
-    init_auth_dir();
-    if (g_auth_dir[0] == 0) {
-        fprintf(stderr, "Erreur: Impossible d'obtenir le chemin du profil utilisateur\n");
-        return;
-    }
-    
-    // Nettoyer la liste existante
-    if (accounts) {
-        for(GList *iter = accounts; iter != NULL; iter = iter->next) {
-            Account *account = iter->data;
-            free(account->name);
-            free(account->auth_file);
-            free(account);
+static UINT get_window_dpi(HWND hwnd) {
+    typedef UINT (WINAPI *GetDpiForWindowFn)(HWND);
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    if (user32) {
+        FARPROC proc = GetProcAddress(user32, "GetDpiForWindow");
+        if (proc && hwnd) {
+            GetDpiForWindowFn fn = (GetDpiForWindowFn)(void *)proc;
+            UINT d = fn(hwnd);
+            if (d > 0) return d;
         }
-        g_list_free(accounts);
-        accounts = NULL;
     }
-    
-    // Rechercher tous les fichiers intl_auth.txt.* dans le dossier
-    wchar_t search_pattern[1024];
-    swprintf(search_pattern, sizeof(search_pattern)/sizeof(search_pattern[0]), L"%ls\\intl_auth.txt.*", g_auth_dir);
-    
-    WIN32_FIND_DATAW find_data;
-    HANDLE find_handle = FindFirstFileW(search_pattern, &find_data);
-    
-    if(find_handle == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "Aucun compte trouvé dans %ls\n", g_auth_dir);
-        return;
+    HDC hdc = GetDC(hwnd);
+    UINT dpi = 96;
+    if (hdc) {
+        int val = GetDeviceCaps(hdc, LOGPIXELSY);
+        if (val > 0) dpi = (UINT)val;
+        ReleaseDC(hwnd, hdc);
+    }
+    return dpi;
+}
+
+static HFONT create_ui_font(UINT dpi) {
+    NONCLIENTMETRICSW ncm;
+    ZeroMemory(&ncm, sizeof(ncm));
+    ncm.cbSize = sizeof(ncm);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+        // Adapter la hauteur de police si le système a renvoyé un DPI différent
+        LOGFONTW lf = ncm.lfMessageFont;
+        lf.lfHeight = -MulDiv(9, (int)dpi, 72);
+        return CreateFontIndirectW(&lf);
+    }
+    return CreateFontW(-MulDiv(9, (int)dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+}
+
+static void show_info(HWND hwnd, const wchar_t *msg) {
+    MessageBoxW(hwnd, msg, APP_TITLE, MB_OK | MB_ICONINFORMATION);
+}
+
+static void show_error(HWND hwnd, const wchar_t *msg) {
+    MessageBoxW(hwnd, msg, APP_TITLE, MB_OK | MB_ICONERROR);
+}
+
+static void free_accounts(AccountList *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; ++i) {
+        free(list->items[i].name);
+        free(list->items[i].auth_file);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static BOOL add_account(AccountList *list, const wchar_t *name, const wchar_t *auth_file) {
+    if (list->count == list->capacity) {
+        size_t new_cap = (list->capacity == 0) ? 8 : list->capacity * 2;
+        Account *new_items = (Account *)realloc(list->items, new_cap * sizeof(Account));
+        if (!new_items) return FALSE;
+        list->items = new_items;
+        list->capacity = new_cap;
     }
 
-    int count = 0;
-    
-    do {
-        // Ignorer les entrées . et ..
-        if(wcscmp(find_data.cFileName, L".") == 0 || wcscmp(find_data.cFileName, L"..") == 0)
-            continue;
-        
-        // Vérifier que le fichier commence bien par "intl_auth.txt."
-        if(wcsncmp(find_data.cFileName, L"intl_auth.txt.", 14) == 0 && wcslen(find_data.cFileName) > 14) {
-            // Extraire le nom du compte à partir du nom du fichier (après le dernier point)
-            WCHAR *account_name = wcsrchr(find_data.cFileName, L'.');
-            if(account_name) {
-                account_name++; // Sauter le point
-                
-                // Créer le chemin complet du fichier
-                wchar_t full_path[1024];
-                swprintf(full_path, sizeof(full_path)/sizeof(full_path[0]), L"%ls\\%ls", g_auth_dir, find_data.cFileName);
-                
-                // Créer et ajouter le compte à la liste
-                Account *account = malloc(sizeof(Account));
-                if (!account) continue; // Vérification d'allocation
-                
-                // Dupliquer directement les chaînes sans conversion inutile
-                account->name = _wcsdup(account_name);
-                account->auth_file = _wcsdup(full_path);
-                
-                if (!account->name || !account->auth_file) {
-                    // Gestion d'erreur d'allocation
-                    if (account->name) free(account->name);
-                    if (account->auth_file) free(account->auth_file);
-                    free(account);
-                    continue;
+    wchar_t *dup_name = _wcsdup(name);
+    wchar_t *dup_file = _wcsdup(auth_file);
+    if (!dup_name || !dup_file) {
+        free(dup_name);
+        free(dup_file);
+        return FALSE;
+    }
+
+    list->items[list->count].name = dup_name;
+    list->items[list->count].auth_file = dup_file;
+    list->count++;
+    return TRUE;
+}
+
+static int compare_accounts(const void *a, const void *b) {
+    const Account *acc_a = (const Account *)a;
+    const Account *acc_b = (const Account *)b;
+    return _wcsicmp(acc_a->name, acc_b->name);
+}
+
+static BOOL init_auth_dir(void) {
+    if (g_auth_dir[0] != L'\0') {
+        return TRUE;
+    }
+
+    const wchar_t *local_app = _wgetenv(L"LOCALAPPDATA");
+    if (local_app && local_app[0] != L'\0') {
+        int n = _snwprintf(g_auth_dir, sizeof(g_auth_dir) / sizeof(g_auth_dir[0]),
+                           L"%ls\\Toaa\\INTL\\28014\\Toaa-Win64-Shipping", local_app);
+        if (n > 0 && n < (int)(sizeof(g_auth_dir) / sizeof(g_auth_dir[0]))) {
+            return TRUE;
+        }
+        g_auth_dir[0] = L'\0';
+    }
+
+    const wchar_t *user_profile = _wgetenv(L"USERPROFILE");
+    if (user_profile && user_profile[0] != L'\0') {
+        int n = _snwprintf(g_auth_dir, sizeof(g_auth_dir) / sizeof(g_auth_dir[0]),
+                           L"%ls\\AppData\\Local\\Toaa\\INTL\\28014\\Toaa-Win64-Shipping", user_profile);
+        if (n > 0 && n < (int)(sizeof(g_auth_dir) / sizeof(g_auth_dir[0]))) {
+            return TRUE;
+        }
+        g_auth_dir[0] = L'\0';
+    }
+
+    return FALSE;
+}
+
+static BOOL file_exists(const wchar_t *path) {
+    DWORD attr = GetFileAttributesW(path);
+    return (attr != INVALID_FILE_ATTRIBUTES) && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL ensure_auth_dir_exists(void) {
+    if (!init_auth_dir()) return FALSE;
+    DWORD attr = GetFileAttributesW(g_auth_dir);
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return TRUE;
+    }
+    int res = SHCreateDirectoryExW(NULL, g_auth_dir, NULL);
+    return (res == ERROR_SUCCESS || res == ERROR_ALREADY_EXISTS);
+}
+
+static BOOL copy_file_atomic(const wchar_t *src, const wchar_t *dst) {
+    wchar_t tmp_path[1100];
+    int n = _snwprintf(tmp_path, sizeof(tmp_path) / sizeof(tmp_path[0]),
+                       L"%ls.tmp.%lu", dst, GetCurrentProcessId());
+    if (n <= 0 || n >= (int)(sizeof(tmp_path) / sizeof(tmp_path[0]))) {
+        return FALSE;
+    }
+
+    BOOL copied = CopyFileW(src, tmp_path, FALSE);
+    if (!copied) {
+        // Fallback avec partage en lecture au cas où un autre processus lit le fichier source
+        HANDLE hSrc = CreateFileW(src, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hSrc == INVALID_HANDLE_VALUE) {
+            return FALSE;
+        }
+
+        HANDLE hDst = CreateFileW(tmp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hDst == INVALID_HANDLE_VALUE) {
+            CloseHandle(hSrc);
+            return FALSE;
+        }
+
+        BYTE buffer[8192];
+        DWORD bytes_read = 0;
+        BOOL rw_ok = TRUE;
+        while (ReadFile(hSrc, buffer, sizeof(buffer), &bytes_read, NULL)) {
+            if (bytes_read == 0) {
+                break;
+            }
+            DWORD total_written = 0;
+            while (total_written < bytes_read) {
+                DWORD bytes_written = 0;
+                if (!WriteFile(hDst, buffer + total_written, bytes_read - total_written, &bytes_written, NULL) ||
+                    bytes_written == 0) {
+                    rw_ok = FALSE;
+                    break;
                 }
-                
-                accounts = g_list_append(accounts, account);
-                count++;
+                total_written += bytes_written;
             }
+            if (!rw_ok) break;
         }
-    } while(FindNextFileW(find_handle, &find_data));
-    
-    FindClose(find_handle);
-    
-    fprintf(stderr, "Info: %d compte(s) trouvé(s)\n", count);
-    
-    // Mettre à jour le combo box seulement s'il existe
-    if(count > 0 && account_combo != NULL) {
-        gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(account_combo));
-        for(GList *iter = accounts; iter != NULL; iter = iter->next) {
-            Account *account = iter->data;
-            gchar *name_utf8 = g_utf16_to_utf8((gunichar2*)account->name, -1, NULL, NULL, NULL);
-            if (name_utf8) {
-                gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(account_combo), name_utf8);
-                g_free(name_utf8);
-            }
+        if (GetLastError() != ERROR_SUCCESS && bytes_read != 0) {
+            rw_ok = FALSE;
         }
-        gtk_combo_box_set_active(GTK_COMBO_BOX(account_combo), 0);
+
+        CloseHandle(hSrc);
+        CloseHandle(hDst);
+
+        if (!rw_ok) {
+            DeleteFileW(tmp_path);
+            return FALSE;
+        }
     }
+
+    if (!MoveFileExW(tmp_path, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp_path);
+        return FALSE;
+    }
+    return TRUE;
 }
 
-// Fonction pour afficher la boîte de dialogue "À propos"
-void show_about_dialog(GtkWidget *widget __attribute__((unused)), gpointer data __attribute__((unused))) {
-    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_application_get_active_window(NULL)),
-                                             GTK_DIALOG_MODAL,
-                                             GTK_MESSAGE_INFO,
-                                             GTK_BUTTONS_OK,
-                                             "Made by Th0r");
-    gtk_window_set_title(GTK_WINDOW(dialog), "À propos");
-    gtk_dialog_run(GTK_DIALOG(dialog));
-    gtk_widget_destroy(dialog);
-}
+static BOOL files_are_equal(const wchar_t *path_a, const wchar_t *path_b) {
+    HANDLE hA = CreateFileW(path_a, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hA == INVALID_HANDLE_VALUE) return FALSE;
 
-int WINAPI wWinMain(HINSTANCE hInstance __attribute__((unused)), HINSTANCE hPrevInstance __attribute__((unused)), PWSTR pCmdLine __attribute__((unused)), int nCmdShow __attribute__((unused))) {
-    // Initialiser GTK
-    gtk_init(NULL, NULL);
-    
-    // Créer la fenêtre principale
-    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "Undawn Reroll");
-    gtk_window_set_default_size(GTK_WINDOW(window), 400, 300);
-    // Fonction de fermeture complète du programme
-    void exit_program(GtkWidget *widget __attribute__((unused)), gpointer data __attribute__((unused))) {
-        // Libérer les ressources
-        g_list_free_full(accounts, (GDestroyNotify)free);
-        gtk_widget_destroy(account_combo);
-        gtk_main_quit();
-        ExitProcess(0); // Force la fermeture complète du processus
+    HANDLE hB = CreateFileW(path_b, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hB == INVALID_HANDLE_VALUE) {
+        CloseHandle(hA);
+        return FALSE;
     }
-    
-    // Gestion des événements de fermeture
-    g_signal_connect(window, "delete-event", G_CALLBACK(exit_program), NULL);
-    g_signal_connect(window, "destroy", G_CALLBACK(exit_program), NULL);
-    
-    // Créer la barre de menu
-    GtkWidget *menubar = gtk_menu_bar_new();
-    
-    // Créer le menu "À propos"
-    GtkWidget *about_menu = gtk_menu_new();
-    GtkWidget *about_item = gtk_menu_item_new_with_label("À propos");
-    gtk_menu_item_set_submenu(GTK_MENU_ITEM(about_item), about_menu);
-    
-    // Créer l'élément de menu "Made by Th0r"
-    GtkWidget *made_by_item = gtk_menu_item_new_with_label("Made by Th0r");
-    g_signal_connect(made_by_item, "activate", G_CALLBACK(show_about_dialog), NULL);
-    gtk_menu_shell_append(GTK_MENU_SHELL(about_menu), made_by_item);
-    
-    // Ajouter le menu à la barre de menu
-    gtk_menu_shell_append(GTK_MENU_SHELL(menubar), about_item);
-    
-    // Créer un conteneur principal
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    gtk_box_pack_start(GTK_BOX(box), menubar, FALSE, FALSE, 0);
-    gtk_container_add(GTK_CONTAINER(window), box);
-    
-    // Créer un sélecteur de compte
-    account_combo = gtk_combo_box_text_new();
-    gtk_box_pack_start(GTK_BOX(box), account_combo, FALSE, FALSE, 0);
-    
-    // Créer un conteneur pour les boutons
-    GtkWidget *button_box = gtk_button_box_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_box_pack_start(GTK_BOX(box), button_box, FALSE, FALSE, 0);
-    
-    // Bouton pour lancer un compte
-    GtkWidget *select_button = gtk_button_new_with_label("Lancer");
-    g_signal_connect(select_button, "clicked", G_CALLBACK(on_select_account), NULL);
-    gtk_container_add(GTK_CONTAINER(button_box), select_button);
-    
-    // Bouton pour créer un nouveau compte
-    GtkWidget *create_button = gtk_button_new_with_label("Créer");
-    g_signal_connect(create_button, "clicked", G_CALLBACK(on_create_account), NULL);
-    gtk_container_add(GTK_CONTAINER(button_box), create_button);
-    
-    // Bouton pour supprimer un compte
-    GtkWidget *delete_button = gtk_button_new_with_label("Supprimer");
-    g_signal_connect(delete_button, "clicked", G_CALLBACK(on_delete_account), NULL);
-    gtk_container_add(GTK_CONTAINER(button_box), delete_button);
-    
-    // Bouton pour mettre à jour un compte
-    GtkWidget *update_button = gtk_button_new_with_label("Mettre à jour");
-    g_signal_connect(update_button, "clicked", G_CALLBACK(on_update_account), NULL);
-    gtk_container_add(GTK_CONTAINER(button_box), update_button);
-    
-    // Charger les comptes disponibles
-    load_accounts();
-    
-    // Afficher tous les widgets
-    gtk_widget_show_all(window);
-    
-    // Lancer la boucle principale GTK
-    gtk_main();
-    return 0;
-}
 
-void on_select_account(GtkWidget *widget __attribute__((unused)), gpointer data __attribute__((unused))) {
-    // Initialiser le chemin d'authentification
-    init_auth_dir();
-    if (g_auth_dir[0] == 0) {
-        GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, 
-            "Erreur: Impossible d'obtenir le chemin du profil utilisateur");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-        return;
-    }
-    
-    if(account_combo == NULL || accounts == NULL) {
-        GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "Aucun compte disponible");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-        return;
-    }
-    
-    gint active = gtk_combo_box_get_active(GTK_COMBO_BOX(account_combo));
-    if(active < 0) return;
-
-    GList *item = g_list_nth(accounts, active);
-    if(item == NULL) return;
-
-    Account *account = item->data;
-    
-    // Vérifier que le fichier source existe
-    if(_waccess(account->auth_file, 0) != 0) {
-        // Vérifier si le fichier existe dans un autre emplacement
-        wchar_t alt_path[1024];
-        swprintf(alt_path, sizeof(alt_path)/sizeof(alt_path[0]), L"%ls\\intl_auth.txt.%ls", g_auth_dir, account->name);
-        
-        if(_waccess(alt_path, 0) == 0) {
-            // Mettre à jour le chemin du fichier dans la structure Account
-            free(account->auth_file);
-            account->auth_file = _wcsdup(alt_path);
-            fprintf(stderr, "Info: Fichier d'authentification trouvé à l'emplacement alternatif: %ls\n", alt_path);
-        } else {
-            // Essayer de créer un nouveau fichier d'authentification vide
-            create_auth_file(account->name);
-            if(_waccess(account->auth_file, 0) != 0) {
-                GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                    GTK_DIALOG_MODAL, 
-                    GTK_MESSAGE_ERROR, 
-                    GTK_BUTTONS_OK, 
-                    "Erreur: Impossible de créer le fichier d'authentification");
-                gtk_dialog_run(GTK_DIALOG(dialog));
-                gtk_widget_destroy(dialog);
-                return;
+    LARGE_INTEGER size_a, size_b;
+    BOOL equal = FALSE;
+    if (GetFileSizeEx(hA, &size_a) && GetFileSizeEx(hB, &size_b) && size_a.QuadPart == size_b.QuadPart) {
+        BYTE buf_a[8192];
+        BYTE buf_b[8192];
+        equal = TRUE;
+        for (;;) {
+            DWORD ra = 0, rb = 0;
+            if (!ReadFile(hA, buf_a, sizeof(buf_a), &ra, NULL) ||
+                !ReadFile(hB, buf_b, sizeof(buf_b), &rb, NULL)) {
+                equal = FALSE;
+                break;
             }
-        }
-    }
-    
-    // Chemin du fichier de destination
-    wchar_t dest_path[1024];
-    swprintf(dest_path, sizeof(dest_path)/sizeof(dest_path[0]), L"%ls\\intl_auth.txt", g_auth_dir);
-    
-    // Supprimer le fichier de destination s'il existe déjà
-    if(_waccess(dest_path, 0) == 0) {
-        if(_wremove(dest_path) != 0) {
-            fprintf(stderr, "Erreur: Impossible de supprimer le fichier d'authentification existant: %ls\n", dest_path);
-            GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Erreur: Impossible de supprimer le fichier d'authentification existant");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-            return;
-        }
-        fprintf(stderr, "Info: Fichier d'authentification existant supprimé: %ls\n", dest_path);
-    }
-    
-    // Le répertoire g_auth_dir devrait déjà exister grâce à init_auth_dir
-    // Vérifier simplement si le répertoire existe, sinon le créer rapidement
-    if(_waccess(g_auth_dir, 0) != 0) {
-        // Créer le répertoire en une seule opération
-        int result = SHCreateDirectoryExW(NULL, g_auth_dir, NULL);
-        if (result != ERROR_SUCCESS && result != ERROR_ALREADY_EXISTS) {
-            fprintf(stderr, "Erreur: Impossible de créer le répertoire: %ls\n", g_auth_dir);
-            GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Erreur: Impossible de créer le répertoire de destination.");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-            return;
-        }
-    }
-    
-    // Copier le fichier d'authentification - Optimisé
-    fprintf(stderr, "Info: Copie du fichier d'authentification\n");
-    BOOL copy_success = FALSE;
-    
-    // Première tentative avec CopyFileW (plus rapide)
-    if(CopyFileW(account->auth_file, dest_path, FALSE)) {
-        copy_success = TRUE;
-        fprintf(stderr, "Info: Fichier copié avec succès\n");
-    } else {
-        DWORD error = GetLastError();
-        fprintf(stderr, "Erreur: Échec de la copie du fichier. Code d'erreur: %ld\n", error);
-        
-        // Essayer une autre méthode de copie si la première échoue
-        FILE *source = _wfopen(account->auth_file, L"rb");
-        if (!source) {
-            fprintf(stderr, "Erreur: Impossible d'ouvrir le fichier source: %ls (Erreur: %d)\n", account->auth_file, errno);
-            GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Erreur: Impossible d'ouvrir le fichier source. Vérifiez les permissions.");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-            return;
-        }
-        
-        // Vérifier que le répertoire de destination existe
-        if (_waccess(g_auth_dir, 0) != 0) {
-            fprintf(stderr, "Info: Création du répertoire de destination: %ls\n", g_auth_dir);
-            int result = SHCreateDirectoryExW(NULL, g_auth_dir, NULL);
-            if (result != ERROR_SUCCESS && result != ERROR_ALREADY_EXISTS) {
-                fprintf(stderr, "Erreur: Impossible de créer le répertoire de destination: %ls (Code: %d)\n", g_auth_dir, result);
-                fclose(source);
-                GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                    GTK_DIALOG_MODAL, 
-                    GTK_MESSAGE_ERROR, 
-                    GTK_BUTTONS_OK, 
-                    "Erreur: Impossible de créer le répertoire de destination.");
-                gtk_dialog_run(GTK_DIALOG(dialog));
-                gtk_widget_destroy(dialog);
-                return;
+            if (ra != rb) {
+                equal = FALSE;
+                break;
             }
-        }
-        
-        FILE *dest = _wfopen(dest_path, L"wb");
-        if (!dest) {
-            fprintf(stderr, "Erreur: Impossible d'ouvrir le fichier de destination: %ls (Erreur: %d)\n", dest_path, errno);
-            fclose(source);
-            GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Erreur: Impossible de créer le fichier de destination. Vérifiez les permissions.");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-            return;
-        }
-        
-        // Copier le contenu du fichier
-        // Utiliser un buffer plus grand pour améliorer les performances
-        char buffer[8192];
-        size_t bytes;
-        BOOL write_error = FALSE;
-        
-        while((bytes = fread(buffer, 1, sizeof(buffer), source)) > 0) {
-            if (fwrite(buffer, 1, bytes, dest) != bytes) {
-                write_error = TRUE;
+            if (ra == 0) {
+                break;
+            }
+            if (memcmp(buf_a, buf_b, ra) != 0) {
+                equal = FALSE;
                 break;
             }
         }
-        
-        fclose(source);
-        fclose(dest);
-        
-        if (write_error) {
-            fprintf(stderr, "Erreur: Problème d'écriture lors de la copie du fichier\n");
-            GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Erreur: Problème d'écriture lors de la copie du fichier.");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-            return;
+    }
+
+    CloseHandle(hA);
+    CloseHandle(hB);
+    return equal;
+}
+
+static void trim_whitespace(wchar_t *s) {
+    if (!s) return;
+    size_t len = wcslen(s);
+    size_t start = 0;
+    while (start < len && iswspace((wint_t)s[start])) {
+        start++;
+    }
+    size_t end = len;
+    while (end > start && iswspace((wint_t)s[end - 1])) {
+        end--;
+    }
+    if (start > 0 && end > start) {
+        memmove(s, s + start, (end - start) * sizeof(wchar_t));
+    }
+    s[end - start] = L'\0';
+}
+
+static BOOL is_reserved_windows_name(const wchar_t *name) {
+    static const wchar_t *const reserved[] = {
+        L"CON", L"PRN", L"AUX", L"NUL",
+        L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8", L"COM9",
+        L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"
+    };
+    for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i) {
+        if (_wcsicmp(name, reserved[i]) == 0) {
+            return TRUE;
         }
-        
-        copy_success = TRUE;
-        fprintf(stderr, "Info: Fichier copié avec succès en utilisant la méthode alternative\n");
     }
-    
-    // Vérifier que la copie a réussi
-    if(!copy_success) {
-        GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-            GTK_DIALOG_MODAL, 
-            GTK_MESSAGE_ERROR, 
-            GTK_BUTTONS_OK, 
-            "Erreur: Le fichier d'authentification n'a pas pu être copié");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-        return;
-    }
-    
-    // Attendre un peu pour s'assurer que le fichier est bien copié
-    Sleep(500);
+    return FALSE;
+}
 
-    // Vérifier que le fichier d'authentification a bien été copié
-    if(_waccess(dest_path, 0) != 0) {
-        GtkWidget *error_dialog = gtk_message_dialog_new(NULL,
-            GTK_DIALOG_MODAL,
-            GTK_MESSAGE_ERROR,
-            GTK_BUTTONS_OK,
-            "Erreur: Le fichier d'authentification n'a pas été trouvé après la copie");
-        gtk_dialog_run(GTK_DIALOG(error_dialog));
-        gtk_widget_destroy(error_dialog);
-        return;
+static BOOL is_valid_account_name(const wchar_t *name, wchar_t *reason, size_t reason_cap) {
+    if (!name || name[0] == L'\0') {
+        _snwprintf(reason, reason_cap, L"Le nom du compte ne peut pas être vide.");
+        return FALSE;
     }
 
-    // Lancer le jeu via Steam avec ShellExecute
-    fprintf(stderr, "Info: Lancement du jeu via Steam avec l'URL: steam://rungameid/1881700\n");
-    
-    // Vérifier que le fichier d'authentification est bien en place avant de lancer le jeu
-    if(_waccess(dest_path, 0) != 0) {
-        GtkWidget *error_dialog = gtk_message_dialog_new(NULL,
-            GTK_DIALOG_MODAL,
-            GTK_MESSAGE_ERROR,
-            GTK_BUTTONS_OK,
-            "Erreur: Le fichier d'authentification n'est pas disponible. Impossible de lancer le jeu.");
-        gtk_dialog_run(GTK_DIALOG(error_dialog));
-        gtk_widget_destroy(error_dialog);
-        return;
+    size_t len = wcslen(name);
+    if (len > MAX_ACCOUNT_NAME) {
+        _snwprintf(reason, reason_cap, L"Le nom du compte ne doit pas dépasser %d caractères.", MAX_ACCOUNT_NAME);
+        return FALSE;
     }
-    
-    // Lancer Steam avec l'ID du jeu en utilisant plusieurs méthodes pour assurer la compatibilité
-    wchar_t steam_url[256] = L"steam://rungameid/1881700";
-    BOOL launch_success = FALSE;
-    
-    // Vérifier si Steam est installé et disponible
-    HKEY hKey;
+
+    if (name[len - 1] == L'.' || name[len - 1] == L' ') {
+        _snwprintf(reason, reason_cap, L"Le nom du compte ne peut pas se terminer par un point ou un espace.");
+        return FALSE;
+    }
+
+    const wchar_t *forbidden = L"\\/:*?\"<>|";
+    for (size_t i = 0; i < len; ++i) {
+        wchar_t c = name[i];
+        if (c < 32 || wcschr(forbidden, c) != NULL) {
+            _snwprintf(reason, reason_cap, L"Le nom contient un caractère interdit sous Windows (\\ / : * ? \" < > |).");
+            return FALSE;
+        }
+    }
+
+    if (is_reserved_windows_name(name)) {
+        _snwprintf(reason, reason_cap, L"Ce nom est réservé par Windows. Choisissez un autre nom.");
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static int find_account_index_ci(const wchar_t *name) {
+    for (size_t i = 0; i < g_accounts.count; ++i) {
+        if (_wcsicmp(g_accounts.items[i].name, name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static BOOL is_game_running(void) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+
+    PROCESSENTRY32W pe;
+    ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+
+    BOOL found = FALSE;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, GAME_PROCESS_NAME) == 0) {
+                found = TRUE;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+
+    CloseHandle(snap);
+    return found;
+}
+
+static BOOL confirm_if_game_running(HWND hwnd, const wchar_t *action_desc) {
+    g_game_is_running = is_game_running();
+    if (!g_game_is_running) {
+        return TRUE;
+    }
+
+    wchar_t msg[512];
+    _snwprintf(msg, sizeof(msg) / sizeof(msg[0]),
+               L"Attention : Undawn (%ls) semble actuellement en cours d'exécution.\n\n"
+               L"%ls alors que le jeu est ouvert peut être ignoré ou écrasé par le jeu.\n\n"
+               L"Voulez-vous tout de même continuer ?",
+               GAME_PROCESS_NAME, action_desc);
+
+    int res = MessageBoxW(hwnd, msg, APP_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    return (res == IDYES);
+}
+
+static void update_status_labels(HWND hwnd) {
+    HWND lbl_active = GetDlgItem(hwnd, IDC_STATUS_ACTIVE);
+    HWND lbl_game = GetDlgItem(hwnd, IDC_STATUS_GAME);
+
+    if (lbl_active) {
+        wchar_t text[512] = L"Compte actif : Indisponible";
+        if (init_auth_dir()) {
+            wchar_t active_path[1024];
+            int n = _snwprintf(active_path, sizeof(active_path) / sizeof(active_path[0]),
+                               L"%ls\\intl_auth.txt", g_auth_dir);
+            if (n > 0 && n < (int)(sizeof(active_path) / sizeof(active_path[0]))) {
+                if (!file_exists(active_path)) {
+                    _snwprintf(text, sizeof(text) / sizeof(text[0]),
+                               L"Compte actif : Aucun (intl_auth.txt absent)");
+                } else {
+                    const wchar_t *match_name = NULL;
+                    int match_count = 0;
+                    for (size_t i = 0; i < g_accounts.count; ++i) {
+                        if (files_are_equal(active_path, g_accounts.items[i].auth_file)) {
+                            if (!match_name) {
+                                match_name = g_accounts.items[i].name;
+                            }
+                            match_count++;
+                        }
+                    }
+                    if (match_name) {
+                        if (match_count > 1) {
+                            _snwprintf(text, sizeof(text) / sizeof(text[0]),
+                                       L"Compte actif : %ls (+ %d identique%ls)",
+                                       match_name, match_count - 1, (match_count - 1) > 1 ? L"s" : L"");
+                        } else {
+                            _snwprintf(text, sizeof(text) / sizeof(text[0]),
+                                       L"Compte actif : %ls", match_name);
+                        }
+                    } else {
+                        _snwprintf(text, sizeof(text) / sizeof(text[0]),
+                                   L"Compte actif : Non sauvegardé (profil inconnu)");
+                    }
+                }
+            }
+        }
+        SetWindowTextW(lbl_active, text);
+    }
+
+    g_game_is_running = is_game_running();
+    if (lbl_game) {
+        if (g_game_is_running) {
+            SetWindowTextW(lbl_game, L"État du jeu : Undawn est en cours d'exécution");
+        } else {
+            SetWindowTextW(lbl_game, L"État du jeu : Undawn fermé");
+        }
+        InvalidateRect(lbl_game, NULL, TRUE);
+    }
+}
+
+static void update_action_buttons_state(HWND hwnd) {
+    BOOL has_sel = FALSE;
+    HWND combo = GetDlgItem(hwnd, IDC_COMBO_ACCOUNTS);
+    if (combo && SendMessageW(combo, CB_GETCURSEL, 0, 0) != CB_ERR) {
+        has_sel = TRUE;
+    }
+
+    EnableWindow(GetDlgItem(hwnd, IDC_BTN_LAUNCH), has_sel);
+    EnableWindow(GetDlgItem(hwnd, IDC_BTN_UPDATE), has_sel);
+    EnableWindow(GetDlgItem(hwnd, IDC_BTN_RENAME), has_sel);
+    EnableWindow(GetDlgItem(hwnd, IDC_BTN_DELETE), has_sel);
+}
+
+static void load_accounts(HWND hwnd, const wchar_t *prefer_name) {
+    HWND combo = GetDlgItem(hwnd, IDC_COMBO_ACCOUNTS);
+
+    // Sauvegarder la sélection actuelle si aucun nom cible n'est demandé
+    wchar_t previous_sel[256] = {0};
+    if (!prefer_name && combo) {
+        LRESULT cur = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+        if (cur != CB_ERR && (size_t)cur < g_accounts.count) {
+            wcsncpy(previous_sel, g_accounts.items[cur].name, sizeof(previous_sel) / sizeof(previous_sel[0]) - 1);
+        }
+    }
+    const wchar_t *target_name = prefer_name ? prefer_name : (previous_sel[0] ? previous_sel : NULL);
+
+    free_accounts(&g_accounts);
+    if (combo) {
+        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    }
+
+    if (init_auth_dir()) {
+        wchar_t pattern[1024];
+        int n = _snwprintf(pattern, sizeof(pattern) / sizeof(pattern[0]),
+                           L"%ls\\intl_auth.txt.*", g_auth_dir);
+        if (n > 0 && n < (int)(sizeof(pattern) / sizeof(pattern[0]))) {
+            WIN32_FIND_DATAW ffd;
+            HANDLE hFind = FindFirstFileW(pattern, &ffd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                        continue;
+                    }
+                    if (wcsncmp(ffd.cFileName, AUTH_PREFIX, AUTH_PREFIX_LEN) == 0 &&
+                        ffd.cFileName[AUTH_PREFIX_LEN] != L'\0') {
+                        const wchar_t *name = ffd.cFileName + AUTH_PREFIX_LEN;
+                        // Ignorer d'éventuels fichiers temporaires résiduels (.tmp.<pid>)
+                        const wchar_t *tmp_suffix = wcsstr(name, L".tmp.");
+                        if (tmp_suffix && iswdigit((wint_t)tmp_suffix[5])) {
+                            continue;
+                        }
+                        wchar_t full_path[1024];
+                        int fn = _snwprintf(full_path, sizeof(full_path) / sizeof(full_path[0]),
+                                            L"%ls\\%ls", g_auth_dir, ffd.cFileName);
+                        if (fn > 0 && fn < (int)(sizeof(full_path) / sizeof(full_path[0]))) {
+                            add_account(&g_accounts, name, full_path);
+                        }
+                    }
+                } while (FindNextFileW(hFind, &ffd));
+                FindClose(hFind);
+            }
+        }
+    }
+
+    if (g_accounts.count > 1) {
+        qsort(g_accounts.items, g_accounts.count, sizeof(Account), compare_accounts);
+    }
+
+    if (combo && g_accounts.count > 0) {
+        int sel_index = 0;
+        for (size_t i = 0; i < g_accounts.count; ++i) {
+            SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)g_accounts.items[i].name);
+            if (target_name && _wcsicmp(g_accounts.items[i].name, target_name) == 0) {
+                sel_index = (int)i;
+            }
+        }
+        SendMessageW(combo, CB_SETCURSEL, (WPARAM)sel_index, 0);
+    }
+
+    update_action_buttons_state(hwnd);
+    update_status_labels(hwnd);
+}
+
+static const Account *get_selected_account(HWND hwnd) {
+    HWND combo = GetDlgItem(hwnd, IDC_COMBO_ACCOUNTS);
+    if (!combo) return NULL;
+    LRESULT idx = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    if (idx == CB_ERR || (size_t)idx >= g_accounts.count) {
+        return NULL;
+    }
+    return &g_accounts.items[idx];
+}
+
+static LRESULT CALLBACK prompt_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    PromptState *state = (PromptState *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    switch (msg) {
+        case WM_CREATE: {
+            CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
+            state = (PromptState *)cs->lpCreateParams;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)state);
+
+            UINT dpi = get_window_dpi(hwnd);
+            int pad = scale_dpi(12, dpi);
+            int client_w = scale_dpi(340, dpi);
+            int lbl_h = scale_dpi(18, dpi);
+            int edit_h = scale_dpi(24, dpi);
+            int btn_w = scale_dpi(88, dpi);
+            int btn_h = scale_dpi(26, dpi);
+            int gap = scale_dpi(8, dpi);
+
+            HWND lbl = CreateWindowExW(0, L"STATIC", state->prompt_label,
+                                       WS_CHILD | WS_VISIBLE,
+                                       pad, pad, client_w - 2 * pad, lbl_h,
+                                       hwnd, (HMENU)IDC_PROMPT_LABEL, g_hInstance, NULL);
+            SendMessageW(lbl, WM_SETFONT, (WPARAM)state->font, TRUE);
+
+            state->edit_hwnd = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", state->buffer,
+                                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                               pad, pad + lbl_h + scale_dpi(6, dpi),
+                                               client_w - 2 * pad, edit_h,
+                                               hwnd, (HMENU)IDC_PROMPT_EDIT, g_hInstance, NULL);
+            SendMessageW(state->edit_hwnd, WM_SETFONT, (WPARAM)state->font, TRUE);
+            SendMessageW(state->edit_hwnd, EM_SETLIMITTEXT, (WPARAM)(state->buffer_cap - 1), 0);
+            SendMessageW(state->edit_hwnd, EM_SETSEL, 0, -1);
+
+            int btn_y = pad + lbl_h + scale_dpi(6, dpi) + edit_h + pad;
+            int cancel_x = client_w - pad - btn_w;
+            int ok_x = cancel_x - gap - btn_w;
+
+            HWND btn_ok = CreateWindowExW(0, L"BUTTON", L"Valider",
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                          ok_x, btn_y, btn_w, btn_h,
+                                          hwnd, (HMENU)(INT_PTR)IDOK, g_hInstance, NULL);
+            SendMessageW(btn_ok, WM_SETFONT, (WPARAM)state->font, TRUE);
+
+            HWND btn_cancel = CreateWindowExW(0, L"BUTTON", L"Annuler",
+                                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                              cancel_x, btn_y, btn_w, btn_h,
+                                              hwnd, (HMENU)(INT_PTR)IDCANCEL, g_hInstance, NULL);
+            SendMessageW(btn_cancel, WM_SETFONT, (WPARAM)state->font, TRUE);
+
+            SetFocus(state->edit_hwnd);
+            return 0;
+        }
+        case WM_COMMAND: {
+            WORD id = LOWORD(wParam);
+            if (id == IDOK && state) {
+                GetWindowTextW(state->edit_hwnd, state->buffer, (int)state->buffer_cap);
+                trim_whitespace(state->buffer);
+                wchar_t reason[256];
+                if (!is_valid_account_name(state->buffer, reason, sizeof(reason) / sizeof(reason[0]))) {
+                    show_error(hwnd, reason);
+                    SetFocus(state->edit_hwnd);
+                    SendMessageW(state->edit_hwnd, EM_SETSEL, 0, -1);
+                    return 0;
+                }
+                state->accepted = TRUE;
+                state->done = TRUE;
+                return 0;
+            }
+            if (id == IDCANCEL && state) {
+                state->accepted = FALSE;
+                state->done = TRUE;
+                return 0;
+            }
+            break;
+        }
+        case WM_CLOSE:
+            if (state) {
+                state->accepted = FALSE;
+                state->done = TRUE;
+            }
+            return 0;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static BOOL prompt_account_name(HWND parent, const wchar_t *title, const wchar_t *label,
+                                const wchar_t *initial, wchar_t *out_buf, size_t out_cap) {
+    PromptState state;
+    ZeroMemory(&state, sizeof(state));
+    state.prompt_label = label;
+    state.buffer = out_buf;
+    state.buffer_cap = out_cap;
+    state.font = g_ui_font;
+
+    if (initial) {
+        wcsncpy(out_buf, initial, out_cap - 1);
+        out_buf[out_cap - 1] = L'\0';
+    } else {
+        out_buf[0] = L'\0';
+    }
+
+    UINT dpi = get_window_dpi(parent);
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    DWORD ex_style = WS_EX_DLGMODALFRAME;
+    RECT rc = {0, 0, scale_dpi(340, dpi), scale_dpi(114, dpi)};
+    AdjustWindowRectEx(&rc, style, FALSE, ex_style);
+
+    int dlg_w = rc.right - rc.left;
+    int dlg_h = rc.bottom - rc.top;
+
+    RECT prc;
+    GetWindowRect(parent, &prc);
+    int x = prc.left + ((prc.right - prc.left) - dlg_w) / 2;
+    int y = prc.top + ((prc.bottom - prc.top) - dlg_h) / 2;
+
+    HWND dlg = CreateWindowExW(ex_style, PROMPT_WND_CLASS, title, style,
+                               x, y, dlg_w, dlg_h, parent, NULL, g_hInstance, &state);
+    if (!dlg) return FALSE;
+
+    EnableWindow(parent, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+
+    MSG msg;
+    while (!state.done && GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+    DestroyWindow(dlg);
+
+    return state.accepted;
+}
+
+static BOOL launch_steam_game(BOOL *out_steam_installed) {
+    HKEY hKey = NULL;
     BOOL steam_installed = FALSE;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         steam_installed = TRUE;
         RegCloseKey(hKey);
-        fprintf(stderr, "Info: Steam est installé sur le système\n");
-    } else {
-        fprintf(stderr, "Avertissement: Steam ne semble pas être installé\n");
     }
-    
-    // Méthode 1: Utiliser ShellExecute directement avec verb "open" explicite
-    fprintf(stderr, "Info: Tentative de lancement via ShellExecuteW avec l'URL: %ls\n", steam_url);
-    HINSTANCE result = ShellExecuteW(NULL, L"open", steam_url, NULL, NULL, SW_SHOWNORMAL);
-    
-    // Vérifier le résultat de ShellExecute
-    if((INT_PTR)result > 32) {
-        fprintf(stderr, "Info: Jeu lancé via ShellExecute\n");
-        launch_success = TRUE;
-    } else {
-        fprintf(stderr, "Info: ShellExecute a échoué avec le code %d, essai avec d'autres méthodes...\n", (int)(INT_PTR)result);
-        
-        // Méthode 2: Essayer avec rundll32
-        wchar_t command[512];
-        swprintf(command, sizeof(command)/sizeof(command[0]), L"rundll32 url.dll,FileProtocolHandler %ls", steam_url);
-        fprintf(stderr, "Info: Tentative de lancement via rundll32 avec la commande: %ls\n", command);
-        
-        STARTUPINFOW si = {0};
-        PROCESS_INFORMATION pi = {0};
-        si.cb = sizeof(si);
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_SHOWNORMAL;
-        
-        // Créer le processus pour lancer Steam via rundll32
-        BOOL process_created = CreateProcessW(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-        
-        if(process_created) {
-            // Fermer les handles du processus et du thread
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-            fprintf(stderr, "Info: Jeu lancé via rundll32\n");
-            launch_success = TRUE;
-        } else {
-            fprintf(stderr, "Info: Échec du lancement via rundll32, erreur: %ld\n", GetLastError());
-            
-            // Méthode 3: Essayer avec explorer.exe
-            memset(&si, 0, sizeof(si));
-            memset(&pi, 0, sizeof(pi));
-            si.cb = sizeof(si);
-            si.dwFlags = STARTF_USESHOWWINDOW;
-            si.wShowWindow = SW_SHOWNORMAL;
-            
-            swprintf(command, sizeof(command)/sizeof(command[0]), L"explorer.exe %ls", steam_url);
-            fprintf(stderr, "Info: Tentative de lancement via explorer.exe avec la commande: %ls\n", command);
-            
-            process_created = CreateProcessW(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-            
-            if(process_created) {
-                // Fermer les handles du processus et du thread
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
-                fprintf(stderr, "Info: Jeu lancé via explorer.exe\n");
-                launch_success = TRUE;
-            } else {
-                fprintf(stderr, "Info: Échec du lancement via explorer.exe, erreur: %ld\n", GetLastError());
-            }
-        }
+    if (out_steam_installed) {
+        *out_steam_installed = steam_installed;
     }
-    
-    if(!launch_success) {
-        // Toutes les méthodes ont échoué
-        GtkWidget *error_dialog;
-        if (!steam_installed) {
-            error_dialog = gtk_message_dialog_new(NULL,
-                GTK_DIALOG_MODAL,
-                GTK_MESSAGE_ERROR,
-                GTK_BUTTONS_OK,
-                "Erreur: Steam ne semble pas être installé sur votre système. Veuillez installer Steam pour pouvoir lancer le jeu.");
-        } else {
-            error_dialog = gtk_message_dialog_new(NULL,
-                GTK_DIALOG_MODAL,
-                GTK_MESSAGE_ERROR,
-                GTK_BUTTONS_OK,
-                "Erreur lors du lancement du jeu via Steam. Vérifiez que Steam est installé et en cours d'exécution.");
-        }
-        gtk_dialog_run(GTK_DIALOG(error_dialog));
-        gtk_widget_destroy(error_dialog);
-        return;
+
+    HINSTANCE res = ShellExecuteW(NULL, L"open", STEAM_RUN_URL, NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)res > 32) {
+        return TRUE;
     }
-    
-    // Attendre plus longtemps pour s'assurer que Steam a le temps de démarrer
-    Sleep(3000);
-    
-    // Vérifier une dernière fois que le fichier d'authentification est toujours présent
-    if(_waccess(dest_path, 0) == 0) {
-        // Vérifier que le fichier d'authentification correspond bien au compte sélectionné
-        wchar_t expected_auth_file[1024];
-        swprintf(expected_auth_file, sizeof(expected_auth_file)/sizeof(expected_auth_file[0]), L"%s\\AppData\\Local\\Toaa\\INTL\\28014\\Toaa-Win64-Shipping\\intl_auth.txt.%ls", _wgetenv(L"USERPROFILE"), account->name);
-        
-        // Comparer les contenus des fichiers pour s'assurer qu'il s'agit du bon compte
-        FILE *src = _wfopen(account->auth_file, L"rb");
-        FILE *dst = _wfopen(dest_path, L"rb");
-        
-        if(src && dst) {
-            char src_buffer[1024] = {0};
-            char dst_buffer[1024] = {0};
-            size_t src_size = fread(src_buffer, 1, sizeof(src_buffer) - 1, src);
-            size_t dst_size = fread(dst_buffer, 1, sizeof(dst_buffer) - 1, dst);
-            
-            fclose(src);
-            fclose(dst);
-            
-            if(src_size == dst_size && memcmp(src_buffer, dst_buffer, src_size) == 0) {
-                fprintf(stderr, "Info: Vérification réussie - Le fichier d'authentification correspond au compte sélectionné\n");
-            } else {
-                fprintf(stderr, "Avertissement: Le fichier d'authentification ne correspond pas au compte sélectionné\n");
-                // Essayer de copier à nouveau le fichier
-                if(CopyFileW(account->auth_file, dest_path, FALSE)) {
-                    fprintf(stderr, "Info: Fichier d'authentification recopié avec succès\n");
-                    // Attendre un peu pour s'assurer que le fichier est bien copié
-                    Sleep(500);
-                }
-            }
-        }
-        
-        fprintf(stderr, "Info: Fichier d'authentification toujours présent après lancement de Steam\n");
-    } else {
-        fprintf(stderr, "Avertissement: Le fichier d'authentification n'est plus présent après lancement de Steam\n");
-        // Essayer de recréer le fichier
-        if(CopyFileW(account->auth_file, dest_path, FALSE)) {
-            fprintf(stderr, "Info: Fichier d'authentification recréé avec succès\n");
-            // Attendre un peu pour s'assurer que le fichier est bien copié
-            Sleep(500);
-        }
+
+    // Fallbacks si l'association de protocole échoue via ShellExecuteW
+    wchar_t cmd[512];
+    _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]), L"rundll32.exe url.dll,FileProtocolHandler %ls", STEAM_RUN_URL);
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_SHOWNORMAL;
+
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return TRUE;
     }
-    
-    // Vérifier une dernière fois que le fichier d'authentification est correct
-    if(_waccess(dest_path, 0) == 0) {
-        FILE *src = _wfopen(account->auth_file, L"rb");
-        FILE *dst = _wfopen(dest_path, L"rb");
-        
-        if(src && dst) {
-            char src_buffer[1024] = {0};
-            char dst_buffer[1024] = {0};
-            size_t src_size = fread(src_buffer, 1, sizeof(src_buffer) - 1, src);
-            size_t dst_size = fread(dst_buffer, 1, sizeof(dst_buffer) - 1, dst);
-            
-            fclose(src);
-            fclose(dst);
-            
-            if(src_size != dst_size || memcmp(src_buffer, dst_buffer, src_size) != 0) {
-                // Forcer une dernière copie si les fichiers ne correspondent toujours pas
-                if(CopyFileW(account->auth_file, dest_path, FALSE)) {
-                    fprintf(stderr, "Info: Fichier d'authentification recopié une dernière fois\n");
-                    Sleep(500);
-                }
-            }
-        }
+
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_SHOWNORMAL;
+    _snwprintf(cmd, sizeof(cmd) / sizeof(cmd[0]), L"explorer.exe %ls", STEAM_RUN_URL);
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return TRUE;
     }
-    
-    // Obtenir le nom du compte pour l'affichage
-    gchar *name_utf8 = g_utf16_to_utf8((gunichar2*)account->name, -1, NULL, NULL, NULL);
-    
-    // Afficher un message de confirmation sans bloquer l'interface
-    // Cela permet à Steam de continuer à se charger pendant que l'utilisateur lit le message
-    GtkWidget *success_dialog = gtk_message_dialog_new(NULL,
-        GTK_DIALOG_MODAL,
-        GTK_MESSAGE_INFO,
-        GTK_BUTTONS_OK,
-        "Compte %s sélectionné. Le jeu est en cours de lancement via Steam.",
-        name_utf8 ? name_utf8 : "inconnu");
-    gtk_dialog_run(GTK_DIALOG(success_dialog));
-    gtk_widget_destroy(success_dialog);
-    
-    if(name_utf8) g_free(name_utf8);
+
+    return FALSE;
 }
 
-// Rétablir les warnings
-#pragma GCC diagnostic pop
-
-void create_auth_file(const wchar_t *account_name) {
-    // Initialiser le chemin d'authentification
-    init_auth_dir();
-    if (g_auth_dir[0] == 0) {
-        fprintf(stderr, "Erreur: Impossible d'obtenir le chemin du profil utilisateur\n");
+static void on_launch_account(HWND hwnd) {
+    const Account *account = get_selected_account(hwnd);
+    if (!account) {
+        show_error(hwnd, L"Aucun compte sélectionné.");
         return;
     }
-    
-    // Créer tous les répertoires parents nécessaires
-    int result = SHCreateDirectoryExW(NULL, g_auth_dir, NULL);
-    if (result != ERROR_SUCCESS && result != ERROR_ALREADY_EXISTS) {
-        wchar_t error_msg[256];
-        FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM, NULL, result, 0, error_msg, 256, NULL);
-        fprintf(stderr, "Erreur: Impossible de créer le répertoire avec SHCreateDirectoryExW: %ls (Code: %d - %ls)\n", g_auth_dir, result, error_msg);
-        
-        // Méthode alternative: créer les répertoires un par un
-        fprintf(stderr, "Info: Tentative de création des répertoires un par un\n");
-        
-        // Extraire le chemin du profil utilisateur
-        wchar_t *user_profile = _wgetenv(L"USERPROFILE");
-        if (!user_profile) {
-            fprintf(stderr, "Erreur: Impossible d'obtenir le chemin du profil utilisateur\n");
-            return;
-        }
-        
-        // Créer le chemin complet manuellement
-        wchar_t base_path[1024];
-        swprintf(base_path, sizeof(base_path)/sizeof(base_path[0]), L"%ls\\AppData", user_profile);
-        _wmkdir(base_path);
-        
-        swprintf(base_path, sizeof(base_path)/sizeof(base_path[0]), L"%ls\\AppData\\Local", user_profile);
-        _wmkdir(base_path);
-        
-        swprintf(base_path, sizeof(base_path)/sizeof(base_path[0]), L"%ls\\AppData\\Local\\Toaa", user_profile);
-        _wmkdir(base_path);
-        
-        swprintf(base_path, sizeof(base_path)/sizeof(base_path[0]), L"%ls\\AppData\\Local\\Toaa\\INTL", user_profile);
-        _wmkdir(base_path);
-        
-        swprintf(base_path, sizeof(base_path)/sizeof(base_path[0]), L"%ls\\AppData\\Local\\Toaa\\INTL\\28014", user_profile);
-        _wmkdir(base_path);
-        
-        swprintf(base_path, sizeof(base_path)/sizeof(base_path[0]), L"%ls\\AppData\\Local\\Toaa\\INTL\\28014\\Toaa-Win64-Shipping", user_profile);
-        if (_wmkdir(base_path) != 0 && errno != EEXIST) {
-            wchar_t error_msg[256];
-            _wcserror_s(error_msg, 256, errno);
-            fprintf(stderr, "Erreur: Impossible de créer le répertoire final: %ls (Erreur: %ls)\n", base_path, error_msg);
-            return;  // Sortir si on ne peut pas créer le répertoire
-        } else {
-            fprintf(stderr, "Info: Répertoire créé ou déjà existant: %ls\n", base_path);
-        }
-    } else {
-        fprintf(stderr, "Info: Répertoire créé ou déjà existant: %ls\n", g_auth_dir);
-    }
-    
-    // Vérifier que le répertoire a bien été créé
-    if(_waccess(g_auth_dir, 0) != 0) {
-        fprintf(stderr, "Erreur: Le répertoire n'a pas pu être créé malgré les tentatives: %ls\n", g_auth_dir);
+
+    if (!file_exists(account->auth_file)) {
+        show_error(hwnd, L"Le fichier de ce profil est introuvable sur le disque. La liste va être actualisée.");
+        load_accounts(hwnd, NULL);
         return;
     }
-    
-    // Chemin du fichier d'authentification source (intl_auth.txt)
-    wchar_t source_path[1024];
-    swprintf(source_path, sizeof(source_path)/sizeof(source_path[0]), L"%ls\\intl_auth.txt", g_auth_dir);
-    
-    // Chemin du fichier d'authentification pour le nouveau compte
-    wchar_t new_auth_path[1024];
-    swprintf(new_auth_path, sizeof(new_auth_path)/sizeof(new_auth_path[0]), L"%ls\\intl_auth.txt.%ls", g_auth_dir, account_name);
-    
-    // Vérifier que le répertoire parent du fichier existe
-    wchar_t dir_path[1024];
-    if (wcsrchr(new_auth_path, L'\\') != NULL) {
-        wcsncpy(dir_path, new_auth_path, wcsrchr(new_auth_path, L'\\') - new_auth_path);
-        dir_path[wcsrchr(new_auth_path, L'\\') - new_auth_path] = L'\0';
-        
-        // Vérifier si le répertoire existe, sinon le créer
-        if (_waccess(dir_path, 0) != 0) {
-            result = SHCreateDirectoryExW(NULL, dir_path, NULL);
-            if (result != ERROR_SUCCESS && result != ERROR_ALREADY_EXISTS) {
-                wchar_t error_msg[256];
-                FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM, NULL, result, 0, error_msg, 256, NULL);
-                fprintf(stderr, "Erreur: Impossible de créer le répertoire pour le fichier: %ls (Code: %d - %ls)\n", dir_path, result, error_msg);
-                return;
-            } else {
-                fprintf(stderr, "Info: Répertoire pour le fichier créé ou déjà existant: %ls\n", dir_path);
-            }
-        }
-    }
-    
-    // Vérifier si le fichier source existe
-    BOOL copy_success = FALSE;
-    if (_waccess(source_path, 0) == 0) {
-        // Copier le fichier source vers le nouveau fichier
-        fprintf(stderr, "Info: Copie du fichier d'authentification existant\n");
-        
-        // Première tentative avec CopyFileW (plus rapide)
-        if (CopyFileW(source_path, new_auth_path, FALSE)) {
-            copy_success = TRUE;
-            fprintf(stderr, "Info: Fichier copié avec succès\n");
-        } else {
-            DWORD error = GetLastError();
-            fprintf(stderr, "Erreur: Échec de la copie du fichier. Code d'erreur: %ld\n", error);
-            
-            // Essayer une autre méthode de copie si la première échoue
-            FILE *source = _wfopen(source_path, L"rb");
-            if (!source) {
-                fprintf(stderr, "Erreur: Impossible d'ouvrir le fichier source: %ls (Erreur: %d)\n", source_path, errno);
-            } else {
-                FILE *dest = _wfopen(new_auth_path, L"wb");
-                if (!dest) {
-                    fprintf(stderr, "Erreur: Impossible d'ouvrir le fichier de destination: %ls (Erreur: %d)\n", new_auth_path, errno);
-                    fclose(source);
-                } else {
-                    // Copier le contenu du fichier
-                    char buffer[8192];
-                    size_t bytes;
-                    BOOL write_error = FALSE;
-                    
-                    while((bytes = fread(buffer, 1, sizeof(buffer), source)) > 0) {
-                        if (fwrite(buffer, 1, bytes, dest) != bytes) {
-                            write_error = TRUE;
-                            break;
-                        }
-                    }
-                    
-                    fclose(source);
-                    fclose(dest);
-                    
-                    if (!write_error) {
-                        copy_success = TRUE;
-                        fprintf(stderr, "Info: Fichier copié avec succès en utilisant la méthode alternative\n");
-                    } else {
-                        fprintf(stderr, "Erreur: Problème d'écriture lors de la copie du fichier\n");
-                    }
-                }
-            }
-        }
-    }
-    
-    // Si la copie a échoué ou si le fichier source n'existe pas, créer un fichier vide
-    if (!copy_success) {
-        fprintf(stderr, "Info: Création d'un nouveau fichier d'authentification vide\n");
-        FILE *fp = _wfopen(new_auth_path, L"wb");
-        if (fp) {
-            fclose(fp);
-            copy_success = TRUE;
-            fprintf(stderr, "Info: Création d'un nouveau fichier d'authentification: %ls\n", new_auth_path);
-        } else {
-            wchar_t error_msg[256];
-            _wcserror_s(error_msg, 256, errno);
-            fprintf(stderr, "Erreur: Impossible de créer le fichier d'authentification: %ls (Erreur: %d - %ls)\n", new_auth_path, errno, error_msg);
-            return;
-        }
-    }
-    
-    // Mettre à jour la structure Account correspondante si elle existe
-    if (copy_success) {
-        for(GList *iter = accounts; iter != NULL; iter = iter->next) {
-            Account *account = iter->data;
-            if (wcscmp(account->name, account_name) == 0) {
-                // Libérer l'ancien chemin et mettre à jour avec le nouveau
-                if (account->auth_file) {
-                    free(account->auth_file);
-                }
-                account->auth_file = _wcsdup(new_auth_path);
-                fprintf(stderr, "Info: Mise à jour du chemin du fichier d'authentification dans la structure Account\n");
-                break;
-            }
-        }
-    } else {
-        fprintf(stderr, "Erreur: Impossible de créer ou copier le fichier d'authentification\n");
-    }
-}
 
-void delete_auth_file(const wchar_t *account_name) {
-    // Initialiser le chemin d'authentification
-    init_auth_dir();
-    if (g_auth_dir[0] == 0) {
-        fprintf(stderr, "Erreur: Impossible d'obtenir le chemin du profil utilisateur\n");
+    if (!confirm_if_game_running(hwnd, L"Activer un autre compte")) {
         return;
     }
-    
-    wchar_t auth_path[1024];
-    swprintf(auth_path, sizeof(auth_path)/sizeof(auth_path[0]), L"%ls\\intl_auth.txt.%ls", g_auth_dir, account_name);
-    
-    if(_waccess(auth_path, 0) == 0) {
-        if(_wremove(auth_path) == 0) {
-            fprintf(stderr, "Info: Suppression du fichier d'authentification: %ls\n", auth_path);
-        } else {
-            fprintf(stderr, "Erreur: Impossible de supprimer le fichier d'authentification: %ls\n", auth_path);
-        }
-    } else {
-        fprintf(stderr, "Erreur: Le fichier d'authentification n'existe pas: %ls\n", auth_path);
-    }
-}
 
-void on_delete_account(GtkWidget *widget __attribute__((unused)), gpointer data __attribute__((unused))) {
-    if(account_combo == NULL || accounts == NULL) {
-        GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "Aucun compte disponible");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
+    if (!ensure_auth_dir_exists()) {
+        show_error(hwnd, L"Erreur : Impossible d'accéder au répertoire d'authentification.");
         return;
     }
-    
-    gint active = gtk_combo_box_get_active(GTK_COMBO_BOX(account_combo));
-    if(active >= 0) {
-        GList *item = g_list_nth(accounts, active);
-        if(item != NULL) {
-            Account *account = item->data;
-            
-            // Demander confirmation
-            gchar *name_utf8 = g_utf16_to_utf8((gunichar2*)account->name, -1, NULL, NULL, NULL);
-            GtkWidget *confirm_dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_QUESTION, 
-                GTK_BUTTONS_YES_NO, 
-                "Êtes-vous sûr de vouloir supprimer le compte %s ?", 
-                name_utf8);
-            
-            gint response = gtk_dialog_run(GTK_DIALOG(confirm_dialog));
-            gtk_widget_destroy(confirm_dialog);
-            
-            if(response == GTK_RESPONSE_YES) {
-                // Supprimer le fichier d'authentification
-                delete_auth_file(account->name);
-                
-                // Supprimer le compte de la liste
-                accounts = g_list_remove(accounts, account);
-                free(account->name);
-                free(account->auth_file);
-                free(account);
-                
-                // Mettre à jour le combo box
-                gtk_combo_box_text_remove(GTK_COMBO_BOX_TEXT(account_combo), active);
-                
-                // Sélectionner le premier compte s'il y en a
-                if(g_list_length(accounts) > 0) {
-                    gtk_combo_box_set_active(GTK_COMBO_BOX(account_combo), 0);
-                }
-                
-                GtkWidget *success_dialog = gtk_message_dialog_new(NULL, 
-                    GTK_DIALOG_MODAL, 
-                    GTK_MESSAGE_INFO, 
-                    GTK_BUTTONS_OK, 
-                    "Compte %s supprimé avec succès", 
-                    name_utf8);
-                gtk_dialog_run(GTK_DIALOG(success_dialog));
-                gtk_widget_destroy(success_dialog);
-            }
-            
-            g_free(name_utf8);
-        }
-    }
-}
 
-
-
-void on_update_account(GtkWidget *widget __attribute__((unused)), gpointer data __attribute__((unused))) {
-    // Initialiser le chemin d'authentification
-    init_auth_dir();
-    if (g_auth_dir[0] == 0) {
-        GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, 
-            "Erreur: Impossible d'obtenir le chemin du profil utilisateur");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-        return;
-    }
-    
-    if(account_combo == NULL || accounts == NULL) {
-        GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "Aucun compte disponible");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-        return;
-    }
-    
-    gint active = gtk_combo_box_get_active(GTK_COMBO_BOX(account_combo));
-    if(active < 0) return;
-
-    GList *item = g_list_nth(accounts, active);
-    if(item == NULL) return;
-
-    Account *account = item->data;
-    
-    // Chemin du fichier source (intl_auth.txt)
-    wchar_t src_path[1024];
-    swprintf(src_path, sizeof(src_path)/sizeof(src_path[0]), L"%ls\\intl_auth.txt", g_auth_dir);
-    
-    // Vérifier que le fichier source existe
-    if(_waccess(src_path, 0) != 0) {
-        GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-            GTK_DIALOG_MODAL, 
-            GTK_MESSAGE_ERROR, 
-            GTK_BUTTONS_OK, 
-            "Erreur: Le fichier d'authentification n'existe pas");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-        return;
-    }
-    
-    // Chemin du fichier de destination (intl_auth.txt.NOM_DU_COMPTE)
     wchar_t dest_path[1024];
-    swprintf(dest_path, sizeof(dest_path)/sizeof(dest_path[0]), L"%ls\\intl_auth.txt.%ls", g_auth_dir, account->name);
-    
-    // Supprimer le fichier de destination s'il existe déjà
-    if(_waccess(dest_path, 0) == 0) {
-        if(_wremove(dest_path) != 0) {
-            fprintf(stderr, "Erreur: Impossible de supprimer le fichier d'authentification existant: %ls\n", dest_path);
-            GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Erreur: Impossible de supprimer le fichier d'authentification existant");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-            return;
-        }
-        fprintf(stderr, "Info: Fichier d'authentification existant supprimé: %ls\n", dest_path);
-    }
-    
-    // Copier le fichier d'authentification
-    fprintf(stderr, "Info: Copie du fichier d'authentification\n");
-    BOOL copy_success = FALSE;
-    
-    // Première tentative avec CopyFileW (plus rapide)
-    if(CopyFileW(src_path, dest_path, FALSE)) {
-        copy_success = TRUE;
-        fprintf(stderr, "Info: Fichier copié avec succès\n");
-    } else {
-        DWORD error = GetLastError();
-        fprintf(stderr, "Erreur: Échec de la copie du fichier. Code d'erreur: %ld\n", error);
-        
-        // Essayer une autre méthode de copie si la première échoue
-        FILE *source = _wfopen(src_path, L"rb");
-        if (!source) {
-            fprintf(stderr, "Erreur: Impossible d'ouvrir le fichier source: %ls (Erreur: %d)\n", src_path, errno);
-            GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Erreur: Impossible d'ouvrir le fichier source. Vérifiez les permissions.");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-            return;
-        }
-        
-        FILE *dest = _wfopen(dest_path, L"wb");
-        if (!dest) {
-            fprintf(stderr, "Erreur: Impossible d'ouvrir le fichier de destination: %ls (Erreur: %d)\n", dest_path, errno);
-            fclose(source);
-            GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Erreur: Impossible de créer le fichier de destination. Vérifiez les permissions.");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-            return;
-        }
-        
-        // Copier le contenu du fichier
-        char buffer[8192];
-        size_t bytes;
-        BOOL write_error = FALSE;
-        
-        while((bytes = fread(buffer, 1, sizeof(buffer), source)) > 0) {
-            if (fwrite(buffer, 1, bytes, dest) != bytes) {
-                write_error = TRUE;
-                break;
-            }
-        }
-        
-        fclose(source);
-        fclose(dest);
-        
-        if (write_error) {
-            fprintf(stderr, "Erreur: Problème d'écriture lors de la copie du fichier\n");
-            GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Erreur: Problème d'écriture lors de la copie du fichier.");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-            return;
-        }
-        
-        copy_success = TRUE;
-        fprintf(stderr, "Info: Fichier copié avec succès en utilisant la méthode alternative\n");
-    }
-    
-    // Vérifier que la copie a réussi
-    if(!copy_success) {
-        GtkWidget *dialog = gtk_message_dialog_new(NULL, 
-            GTK_DIALOG_MODAL, 
-            GTK_MESSAGE_ERROR, 
-            GTK_BUTTONS_OK, 
-            "Erreur: Le fichier d'authentification n'a pas pu être copié");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
+    int n = _snwprintf(dest_path, sizeof(dest_path) / sizeof(dest_path[0]), L"%ls\\intl_auth.txt", g_auth_dir);
+    if (n <= 0 || n >= (int)(sizeof(dest_path) / sizeof(dest_path[0]))) {
+        show_error(hwnd, L"Erreur : Chemin de destination trop long.");
         return;
     }
-    
-    // Mettre à jour le chemin du fichier dans la structure Account
-    free(account->auth_file);
-    account->auth_file = _wcsdup(dest_path);
-    
-    // Obtenir le nom du compte pour l'affichage
-    gchar *name_utf8 = g_utf16_to_utf8((gunichar2*)account->name, -1, NULL, NULL, NULL);
-    
-    // Afficher un message de confirmation
-    GtkWidget *success_dialog = gtk_message_dialog_new(NULL,
-        GTK_DIALOG_MODAL,
-        GTK_MESSAGE_INFO,
-        GTK_BUTTONS_OK,
-        "Compte %s mis à jour avec succès",
-        name_utf8 ? name_utf8 : "inconnu");
-    gtk_dialog_run(GTK_DIALOG(success_dialog));
-    gtk_widget_destroy(success_dialog);
-    
-    if(name_utf8) g_free(name_utf8);
-    
-    // Recharger la liste des comptes
-    load_accounts();
+
+    if (!copy_file_atomic(account->auth_file, dest_path) || !files_are_equal(account->auth_file, dest_path)) {
+        show_error(hwnd, L"Erreur : Impossible de copier le fichier d'authentification actif.");
+        return;
+    }
+
+    update_status_labels(hwnd);
+
+    BOOL launch_steam = (SendMessageW(GetDlgItem(hwnd, IDC_CHK_STEAM), BM_GETCHECK, 0, 0) == BST_CHECKED);
+    if (launch_steam) {
+        BOOL steam_installed = FALSE;
+        if (!launch_steam_game(&steam_installed)) {
+            if (!steam_installed) {
+                show_error(hwnd, L"Compte activé, mais Steam ne semble pas installé sur votre système.");
+            } else {
+                show_error(hwnd, L"Compte activé, mais erreur lors du lancement du jeu via Steam.");
+            }
+            return;
+        }
+        wchar_t msg[384];
+        _snwprintf(msg, sizeof(msg) / sizeof(msg[0]),
+                   L"Compte \"%ls\" activé.\nLe jeu est en cours de lancement via Steam.", account->name);
+        show_info(hwnd, msg);
+    } else {
+        wchar_t msg[384];
+        _snwprintf(msg, sizeof(msg) / sizeof(msg[0]),
+                   L"Compte \"%ls\" activé sans lancer Steam.", account->name);
+        show_info(hwnd, msg);
+    }
 }
 
-void on_create_account(GtkWidget *widget __attribute__((unused)), gpointer data __attribute__((unused))) {
-    // Créer une boîte de dialogue pour saisir le nom du compte
-    GtkWidget *dialog = gtk_dialog_new_with_buttons("Créer un nouveau compte", 
-        NULL, 
-        GTK_DIALOG_MODAL, 
-        "Annuler", GTK_RESPONSE_CANCEL, 
-        "Créer", GTK_RESPONSE_ACCEPT, 
-        NULL);
-    
-    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-    
-    GtkWidget *label = gtk_label_new("Nom du compte :");
-    gtk_container_add(GTK_CONTAINER(content_area), label);
-    
-    GtkWidget *entry = gtk_entry_new();
-    gtk_container_add(GTK_CONTAINER(content_area), entry);
-    
-    gtk_widget_show_all(dialog);
-    
-    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
-    
-    if(response == GTK_RESPONSE_ACCEPT) {
-        const gchar *account_name = gtk_entry_get_text(GTK_ENTRY(entry));
-        
-        if(strlen(account_name) > 0) {
-            // Convertir le nom du compte en wchar_t
-            gunichar2 *account_name_utf16 = g_utf8_to_utf16(account_name, -1, NULL, NULL, NULL);
-            
-            // Créer le fichier d'authentification
-            create_auth_file((wchar_t*)account_name_utf16);
-            
-            // Recharger la liste des comptes
-            load_accounts();
-            
-            // Sélectionner le nouveau compte
-            for(guint i = 0; i < g_list_length(accounts); i++) {
-                GList *item = g_list_nth(accounts, i);
-                if(item != NULL) {
-                    Account *account = item->data;
-                    gchar *name_utf8 = g_utf16_to_utf8((gunichar2*)account->name, -1, NULL, NULL, NULL);
-                    
-                    if(strcmp(name_utf8, account_name) == 0) {
-                        gtk_combo_box_set_active(GTK_COMBO_BOX(account_combo), i);
-                        g_free(name_utf8);
-                        break;
-                    }
-                    
-                    g_free(name_utf8);
-                }
-            }
-            
-            g_free(account_name_utf16);
-            
-            GtkWidget *success_dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_INFO, 
-                GTK_BUTTONS_OK, 
-                "Compte %s créé avec succès", 
-                account_name);
-            gtk_dialog_run(GTK_DIALOG(success_dialog));
-            gtk_widget_destroy(success_dialog);
+static void on_create_account(HWND hwnd) {
+    if (!ensure_auth_dir_exists()) {
+        show_error(hwnd, L"Erreur : Impossible d'accéder au dossier d'authentification.");
+        return;
+    }
+
+    wchar_t name_buf[MAX_ACCOUNT_NAME + 1] = {0};
+    if (!prompt_account_name(hwnd, L"Créer un nouveau compte", L"Nom du compte :", NULL,
+                             name_buf, sizeof(name_buf) / sizeof(name_buf[0]))) {
+        return;
+    }
+
+    if (find_account_index_ci(name_buf) >= 0) {
+        show_error(hwnd, L"Un compte portant ce nom existe déjà. Utilisez « Mettre à jour » pour l'écraser.");
+        return;
+    }
+
+    wchar_t source_path[1024];
+    int sn = _snwprintf(source_path, sizeof(source_path) / sizeof(source_path[0]), L"%ls\\intl_auth.txt", g_auth_dir);
+    wchar_t new_path[1024];
+    int dn = _snwprintf(new_path, sizeof(new_path) / sizeof(new_path[0]), L"%ls\\%ls%ls", g_auth_dir, AUTH_PREFIX, name_buf);
+    if (sn <= 0 || sn >= (int)(sizeof(source_path) / sizeof(source_path[0])) ||
+        dn <= 0 || dn >= (int)(sizeof(new_path) / sizeof(new_path[0]))) {
+        show_error(hwnd, L"Erreur : Chemin trop long.");
+        return;
+    }
+
+    BOOL has_active = file_exists(source_path);
+    if (has_active) {
+        if (!confirm_if_game_running(hwnd, L"Sauvegarder la session actuelle")) {
+            return;
+        }
+        if (!copy_file_atomic(source_path, new_path)) {
+            show_error(hwnd, L"Erreur : Impossible de copier le fichier d'authentification actuel.");
+            return;
+        }
+    } else {
+        int res = MessageBoxW(hwnd,
+                              L"Aucun fichier intl_auth.txt actif n'a été trouvé.\n"
+                              L"Voulez-vous quand même créer un fichier de profil vide ?",
+                              APP_TITLE, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (res != IDYES) {
+            return;
+        }
+        HANDLE hFile = CreateFileW(new_path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            show_error(hwnd, L"Erreur : Impossible de créer le fichier de profil.");
+            return;
+        }
+        CloseHandle(hFile);
+    }
+
+    load_accounts(hwnd, name_buf);
+
+    wchar_t msg[384];
+    _snwprintf(msg, sizeof(msg) / sizeof(msg[0]), L"Compte \"%ls\" créé avec succès.", name_buf);
+    show_info(hwnd, msg);
+}
+
+static void on_update_account(HWND hwnd) {
+    const Account *account = get_selected_account(hwnd);
+    if (!account) {
+        show_error(hwnd, L"Aucun compte sélectionné.");
+        return;
+    }
+
+    if (!init_auth_dir()) {
+        show_error(hwnd, L"Erreur : Impossible de déterminer le dossier d'authentification.");
+        return;
+    }
+
+    wchar_t src_path[1024];
+    int n = _snwprintf(src_path, sizeof(src_path) / sizeof(src_path[0]), L"%ls\\intl_auth.txt", g_auth_dir);
+    if (n <= 0 || n >= (int)(sizeof(src_path) / sizeof(src_path[0])) || !file_exists(src_path)) {
+        show_error(hwnd, L"Erreur : Le fichier d'authentification actif (intl_auth.txt) est introuvable.");
+        return;
+    }
+
+    if (!confirm_if_game_running(hwnd, L"Mettre à jour ce profil depuis la session active")) {
+        return;
+    }
+
+    wchar_t selected_name[256];
+    wcsncpy(selected_name, account->name, sizeof(selected_name) / sizeof(selected_name[0]) - 1);
+    selected_name[sizeof(selected_name) / sizeof(selected_name[0]) - 1] = L'\0';
+
+    if (!copy_file_atomic(src_path, account->auth_file)) {
+        show_error(hwnd, L"Erreur : Impossible de mettre à jour le profil (l'ancienne sauvegarde a été conservée).");
+        return;
+    }
+
+    load_accounts(hwnd, selected_name);
+
+    wchar_t msg[384];
+    _snwprintf(msg, sizeof(msg) / sizeof(msg[0]), L"Compte \"%ls\" mis à jour avec succès.", selected_name);
+    show_info(hwnd, msg);
+}
+
+static void on_rename_account(HWND hwnd) {
+    const Account *account = get_selected_account(hwnd);
+    if (!account) {
+        show_error(hwnd, L"Aucun compte sélectionné.");
+        return;
+    }
+
+    if (!file_exists(account->auth_file)) {
+        show_error(hwnd, L"Le fichier du profil est introuvable sur le disque.");
+        load_accounts(hwnd, NULL);
+        return;
+    }
+
+    wchar_t new_name[MAX_ACCOUNT_NAME + 1] = {0};
+    if (!prompt_account_name(hwnd, L"Renommer le compte", L"Nouveau nom :", account->name,
+                             new_name, sizeof(new_name) / sizeof(new_name[0]))) {
+        return;
+    }
+
+    if (wcscmp(new_name, account->name) == 0) {
+        return;
+    }
+
+    int existing_idx = find_account_index_ci(new_name);
+    if (existing_idx >= 0 && &g_accounts.items[existing_idx] != account) {
+        show_error(hwnd, L"Un autre compte porte déjà ce nom.");
+        return;
+    }
+
+    wchar_t new_path[1024];
+    int dn = _snwprintf(new_path, sizeof(new_path) / sizeof(new_path[0]),
+                        L"%ls\\%ls%ls", g_auth_dir, AUTH_PREFIX, new_name);
+    if (dn <= 0 || dn >= (int)(sizeof(new_path) / sizeof(new_path[0]))) {
+        show_error(hwnd, L"Erreur : Chemin trop long.");
+        return;
+    }
+
+    if (!MoveFileW(account->auth_file, new_path)) {
+        show_error(hwnd, L"Erreur : Impossible de renommer le fichier du profil.");
+        return;
+    }
+
+    load_accounts(hwnd, new_name);
+
+    wchar_t msg[384];
+    _snwprintf(msg, sizeof(msg) / sizeof(msg[0]), L"Compte renommé en \"%ls\" avec succès.", new_name);
+    show_info(hwnd, msg);
+}
+
+static void on_delete_account(HWND hwnd) {
+    const Account *account = get_selected_account(hwnd);
+    if (!account) {
+        show_error(hwnd, L"Aucun compte sélectionné.");
+        return;
+    }
+
+    wchar_t confirm_msg[384];
+    _snwprintf(confirm_msg, sizeof(confirm_msg) / sizeof(confirm_msg[0]),
+               L"Êtes-vous sûr de vouloir supprimer le compte \"%ls\" ?", account->name);
+    if (MessageBoxW(hwnd, confirm_msg, APP_TITLE, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+
+    wchar_t deleted_name[256];
+    wcsncpy(deleted_name, account->name, sizeof(deleted_name) / sizeof(deleted_name[0]) - 1);
+    deleted_name[sizeof(deleted_name) / sizeof(deleted_name[0]) - 1] = L'\0';
+
+    if (file_exists(account->auth_file)) {
+        if (!DeleteFileW(account->auth_file)) {
+            show_error(hwnd, L"Erreur : Impossible de supprimer le fichier du profil sur le disque.");
+            return;
+        }
+    } else {
+        show_error(hwnd, L"Le fichier du profil n'existait déjà plus sur le disque.");
+        load_accounts(hwnd, NULL);
+        return;
+    }
+
+    load_accounts(hwnd, NULL);
+
+    wchar_t msg[384];
+    _snwprintf(msg, sizeof(msg) / sizeof(msg[0]), L"Compte \"%ls\" supprimé avec succès.", deleted_name);
+    show_info(hwnd, msg);
+}
+
+static void on_open_folder(HWND hwnd) {
+    if (!ensure_auth_dir_exists()) {
+        show_error(hwnd, L"Erreur : Impossible d'accéder au dossier des profils.");
+        return;
+    }
+    HINSTANCE res = ShellExecuteW(hwnd, L"open", g_auth_dir, NULL, NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)res <= 32) {
+        show_error(hwnd, L"Erreur : Impossible d'ouvrir le dossier dans l'Explorateur.");
+    }
+}
+
+static void on_backup_profiles(HWND hwnd) {
+    if (!init_auth_dir()) {
+        show_error(hwnd, L"Erreur : Dossier des profils introuvable.");
+        return;
+    }
+
+    wchar_t active_path[1024];
+    _snwprintf(active_path, sizeof(active_path) / sizeof(active_path[0]), L"%ls\\intl_auth.txt", g_auth_dir);
+    BOOL has_active = file_exists(active_path);
+
+    if (g_accounts.count == 0 && !has_active) {
+        show_info(hwnd, L"Aucun profil ni fichier d'authentification à sauvegarder.");
+        return;
+    }
+
+    BROWSEINFOW bi;
+    ZeroMemory(&bi, sizeof(bi));
+    bi.hwndOwner = hwnd;
+    bi.lpszTitle = L"Choisissez le dossier où créer la sauvegarde des profils :";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) {
+        return;
+    }
+
+    wchar_t dest_root[MAX_PATH] = {0};
+    BOOL got_path = SHGetPathFromIDListW(pidl, dest_root);
+    CoTaskMemFree(pidl);
+    if (!got_path || dest_root[0] == L'\0') {
+        show_error(hwnd, L"Erreur : Dossier sélectionné invalide.");
+        return;
+    }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t backup_dir[1024];
+    int bn = _snwprintf(backup_dir, sizeof(backup_dir) / sizeof(backup_dir[0]),
+                        L"%ls\\UndawnReroll_Backup_%04u%02u%02u_%02u%02u%02u",
+                        dest_root, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    if (bn <= 0 || bn >= (int)(sizeof(backup_dir) / sizeof(backup_dir[0]))) {
+        show_error(hwnd, L"Erreur : Chemin de sauvegarde trop long.");
+        return;
+    }
+
+    int mk = SHCreateDirectoryExW(hwnd, backup_dir, NULL);
+    if (mk != ERROR_SUCCESS && mk != ERROR_ALREADY_EXISTS) {
+        show_error(hwnd, L"Erreur : Impossible de créer le dossier de sauvegarde.");
+        return;
+    }
+
+    size_t copied = 0;
+    size_t failed = 0;
+
+    if (has_active) {
+        wchar_t dst_active[1100];
+        _snwprintf(dst_active, sizeof(dst_active) / sizeof(dst_active[0]), L"%ls\\intl_auth.txt", backup_dir);
+        if (copy_file_atomic(active_path, dst_active)) {
+            copied++;
         } else {
-            GtkWidget *error_dialog = gtk_message_dialog_new(NULL, 
-                GTK_DIALOG_MODAL, 
-                GTK_MESSAGE_ERROR, 
-                GTK_BUTTONS_OK, 
-                "Le nom du compte ne peut pas être vide");
-            gtk_dialog_run(GTK_DIALOG(error_dialog));
-            gtk_widget_destroy(error_dialog);
+            failed++;
         }
     }
-    
-    gtk_widget_destroy(dialog);
+
+    for (size_t i = 0; i < g_accounts.count; ++i) {
+        wchar_t dst_prof[1100];
+        int pn = _snwprintf(dst_prof, sizeof(dst_prof) / sizeof(dst_prof[0]),
+                            L"%ls\\%ls%ls", backup_dir, AUTH_PREFIX, g_accounts.items[i].name);
+        if (pn > 0 && pn < (int)(sizeof(dst_prof) / sizeof(dst_prof[0])) &&
+            copy_file_atomic(g_accounts.items[i].auth_file, dst_prof)) {
+            copied++;
+        } else {
+            failed++;
+        }
+    }
+
+    wchar_t summary[1280];
+    if (failed == 0) {
+        _snwprintf(summary, sizeof(summary) / sizeof(summary[0]),
+                   L"Sauvegarde terminée : %zu fichier(s) copié(s) dans :\n%ls", copied, backup_dir);
+        show_info(hwnd, summary);
+    } else {
+        _snwprintf(summary, sizeof(summary) / sizeof(summary[0]),
+                   L"Sauvegarde partielle : %zu fichier(s) copié(s), %zu échec(s) dans :\n%ls",
+                   copied, failed, backup_dir);
+        show_error(hwnd, summary);
+    }
 }
 
-// Rétablir les warnings
-#pragma GCC diagnostic pop
+static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            UINT dpi = get_window_dpi(hwnd);
+            g_ui_font = create_ui_font(dpi);
+
+            int pad = scale_dpi(14, dpi);
+            int client_w = scale_dpi(460, dpi);
+            int inner_w = client_w - 2 * pad;
+            int y = pad;
+
+            int lbl_h = scale_dpi(18, dpi);
+            HWND lbl_sel = CreateWindowExW(0, L"STATIC", L"Compte sélectionné :",
+                                           WS_CHILD | WS_VISIBLE,
+                                           pad, y, inner_w, lbl_h,
+                                           hwnd, (HMENU)IDC_LABEL_SELECT, g_hInstance, NULL);
+            SendMessageW(lbl_sel, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            y += lbl_h + scale_dpi(4, dpi);
+
+            int refresh_w = scale_dpi(96, dpi);
+            int gap = scale_dpi(8, dpi);
+            int combo_w = inner_w - refresh_w - gap;
+            int combo_h = scale_dpi(24, dpi);
+
+            HWND combo = CreateWindowExW(0, L"COMBOBOX", NULL,
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
+                                         CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+                                         pad, y, combo_w, scale_dpi(220, dpi),
+                                         hwnd, (HMENU)IDC_COMBO_ACCOUNTS, g_hInstance, NULL);
+            SendMessageW(combo, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+
+            HWND btn_refresh = CreateWindowExW(0, L"BUTTON", L"Rafraîchir",
+                                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                               pad + combo_w + gap, y - scale_dpi(1, dpi), refresh_w, combo_h + scale_dpi(2, dpi),
+                                               hwnd, (HMENU)IDC_BTN_REFRESH, g_hInstance, NULL);
+            SendMessageW(btn_refresh, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            y += combo_h + scale_dpi(12, dpi);
+
+            HWND lbl_active = CreateWindowExW(0, L"STATIC", L"Compte actif : ...",
+                                              WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
+                                              pad, y, inner_w, lbl_h,
+                                              hwnd, (HMENU)IDC_STATUS_ACTIVE, g_hInstance, NULL);
+            SendMessageW(lbl_active, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            y += lbl_h + scale_dpi(4, dpi);
+
+            HWND lbl_game = CreateWindowExW(0, L"STATIC", L"État du jeu : ...",
+                                            WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
+                                            pad, y, inner_w, lbl_h,
+                                            hwnd, (HMENU)IDC_STATUS_GAME, g_hInstance, NULL);
+            SendMessageW(lbl_game, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            y += lbl_h + scale_dpi(10, dpi);
+
+            HWND chk_steam = CreateWindowExW(0, L"BUTTON", L"Lancer le jeu via Steam",
+                                             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                             pad, y, inner_w, scale_dpi(20, dpi),
+                                             hwnd, (HMENU)IDC_CHK_STEAM, g_hInstance, NULL);
+            SendMessageW(chk_steam, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            SendMessageW(chk_steam, BM_SETCHECK, BST_CHECKED, 0);
+            y += scale_dpi(20, dpi) + scale_dpi(12, dpi);
+
+            int btn3_w = (inner_w - 2 * gap) / 3;
+            int btn_h = scale_dpi(28, dpi);
+
+            HWND btn_launch = CreateWindowExW(0, L"BUTTON", L"Lancer",
+                                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                              pad, y, btn3_w, btn_h,
+                                              hwnd, (HMENU)IDC_BTN_LAUNCH, g_hInstance, NULL);
+            SendMessageW(btn_launch, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+
+            HWND btn_create = CreateWindowExW(0, L"BUTTON", L"Créer",
+                                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                              pad + btn3_w + gap, y, btn3_w, btn_h,
+                                              hwnd, (HMENU)IDC_BTN_CREATE, g_hInstance, NULL);
+            SendMessageW(btn_create, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+
+            HWND btn_update = CreateWindowExW(0, L"BUTTON", L"Mettre à jour",
+                                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                              pad + 2 * (btn3_w + gap), y, inner_w - 2 * (btn3_w + gap), btn_h,
+                                              hwnd, (HMENU)IDC_BTN_UPDATE, g_hInstance, NULL);
+            SendMessageW(btn_update, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+            y += btn_h + gap;
+
+            int btn2_w = (inner_w - gap) / 2;
+            HWND btn_rename = CreateWindowExW(0, L"BUTTON", L"Renommer",
+                                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                              pad, y, btn2_w, btn_h,
+                                              hwnd, (HMENU)IDC_BTN_RENAME, g_hInstance, NULL);
+            SendMessageW(btn_rename, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+
+            HWND btn_delete = CreateWindowExW(0, L"BUTTON", L"Supprimer",
+                                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                              pad + btn2_w + gap, y, inner_w - btn2_w - gap, btn_h,
+                                              hwnd, (HMENU)IDC_BTN_DELETE, g_hInstance, NULL);
+            SendMessageW(btn_delete, WM_SETFONT, (WPARAM)g_ui_font, TRUE);
+
+            load_accounts(hwnd, NULL);
+            return 0;
+        }
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) != WA_INACTIVE) {
+                update_status_labels(hwnd);
+            }
+            return 0;
+        case WM_CTLCOLORSTATIC: {
+            HDC hdc = (HDC)wParam;
+            HWND ctrl = (HWND)lParam;
+            SetBkMode(hdc, TRANSPARENT);
+            if (GetDlgCtrlID(ctrl) == IDC_STATUS_GAME) {
+                SetTextColor(hdc, g_game_is_running ? RGB(180, 30, 30) : RGB(20, 120, 40));
+            } else {
+                SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+            }
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        case WM_COMMAND: {
+            WORD id = LOWORD(wParam);
+            WORD code = HIWORD(wParam);
+            switch (id) {
+                case IDC_COMBO_ACCOUNTS:
+                    if (code == CBN_SELCHANGE) {
+                        update_action_buttons_state(hwnd);
+                    }
+                    break;
+                case IDC_BTN_REFRESH:
+                    load_accounts(hwnd, NULL);
+                    break;
+                case IDC_BTN_LAUNCH:
+                    on_launch_account(hwnd);
+                    break;
+                case IDC_BTN_CREATE:
+                    on_create_account(hwnd);
+                    break;
+                case IDC_BTN_UPDATE:
+                    on_update_account(hwnd);
+                    break;
+                case IDC_BTN_RENAME:
+                    on_rename_account(hwnd);
+                    break;
+                case IDC_BTN_DELETE:
+                    on_delete_account(hwnd);
+                    break;
+                case IDM_OPEN_FOLDER:
+                    on_open_folder(hwnd);
+                    break;
+                case IDM_BACKUP_PROFILES:
+                    on_backup_profiles(hwnd);
+                    break;
+                case IDM_EXIT:
+                    DestroyWindow(hwnd);
+                    break;
+                case IDM_ABOUT:
+                    MessageBoxW(hwnd, L"Made by Th0r", L"À propos", MB_OK | MB_ICONINFORMATION);
+                    break;
+            }
+            return 0;
+        }
+        case WM_DESTROY:
+            free_accounts(&g_accounts);
+            if (g_ui_font) {
+                DeleteObject(g_ui_font);
+                g_ui_font = NULL;
+            }
+            PostQuitMessage(0);
+            return 0;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    (void)hPrevInstance;
+    (void)pCmdLine;
+
+    g_hInstance = hInstance;
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    INITCOMMONCONTROLSEX icc;
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icc);
+
+    HICON hIconBig = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR);
+    HICON hIconSmall = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                         GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = main_wnd_proc;
+    wc.hInstance = hInstance;
+    wc.hIcon = hIconBig;
+    wc.hIconSm = hIconSmall;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszMenuName = MAKEINTRESOURCEW(IDM_MENU);
+    wc.lpszClassName = MAIN_WND_CLASS;
+
+    if (!RegisterClassExW(&wc)) {
+        if (SUCCEEDED(hr)) CoUninitialize();
+        return 1;
+    }
+
+    WNDCLASSEXW pwc;
+    ZeroMemory(&pwc, sizeof(pwc));
+    pwc.cbSize = sizeof(pwc);
+    pwc.lpfnWndProc = prompt_wnd_proc;
+    pwc.hInstance = hInstance;
+    pwc.hIcon = hIconBig;
+    pwc.hIconSm = hIconSmall;
+    pwc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    pwc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    pwc.lpszClassName = PROMPT_WND_CLASS;
+
+    if (!RegisterClassExW(&pwc)) {
+        if (SUCCEEDED(hr)) CoUninitialize();
+        return 1;
+    }
+
+    UINT dpi = get_window_dpi(NULL);
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT rc = {0, 0, scale_dpi(460, dpi), scale_dpi(218, dpi)};
+    AdjustWindowRectEx(&rc, style, TRUE, 0);
+
+    int win_w = rc.right - rc.left;
+    int win_h = rc.bottom - rc.top;
+
+    RECT work_area;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
+    int pos_x = work_area.left + ((work_area.right - work_area.left) - win_w) / 2;
+    int pos_y = work_area.top + ((work_area.bottom - work_area.top) - win_h) / 2;
+
+    g_main_hwnd = CreateWindowExW(0, MAIN_WND_CLASS, APP_TITLE, style,
+                                  pos_x, pos_y, win_w, win_h,
+                                  NULL, NULL, hInstance, NULL);
+    if (!g_main_hwnd) {
+        if (SUCCEEDED(hr)) CoUninitialize();
+        return 1;
+    }
+
+    ShowWindow(g_main_hwnd, nCmdShow);
+    UpdateWindow(g_main_hwnd);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(g_main_hwnd, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    if (SUCCEEDED(hr)) {
+        CoUninitialize();
+    }
+    return (int)msg.wParam;
+}

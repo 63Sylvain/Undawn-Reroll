@@ -59,8 +59,5 @@ Pour générer également l'archive portable et `UndawnReroll_OneFile.exe` :
 make onefile
 ```
 
-### Script utilitaire GTK3 (héritage / développement)
-Si vous travaillez aussi avec d'anciens binaires GTK3 compilés sous MSYS2, le script `Verifier_Env_GTK.bat` (`Verifier_Env_GTK.ps1`) vérifie et configure automatiquement `C:\msys64\mingw64\bin` dans votre variable d'environnement `PATH`.
-
 ---
 **Note** : Ce logiciel n'est pas affilié à Level Infinite ou LightSpeed Studios. Utilisez-le à vos propres risques.
